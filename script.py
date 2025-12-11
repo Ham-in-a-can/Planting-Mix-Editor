@@ -187,6 +187,37 @@ def _get_element_id_int(eid):
         return None
 
 
+def _ensure_elementid_integervalue_alias():
+    """Expose ElementId.IntegerValue on newer Revit versions that use Value."""
+    try:
+        # If the attribute already exists, nothing to do.
+        if hasattr(DB.ElementId, 'IntegerValue'):
+            return
+
+        def _get_integer_value(self):
+            try:
+                return self.Value
+            except Exception:
+                try:
+                    return int(self)
+                except Exception:
+                    return None
+
+        # Attach a Python property as a compatibility alias.
+        try:
+            DB.ElementId.IntegerValue = property(_get_integer_value)
+        except Exception:
+            # Fallback: attach a simple attribute if property assignment fails.
+            setattr(DB.ElementId, 'IntegerValue', _get_integer_value)
+    except Exception:
+        # Best-effort; if we cannot patch, leave the environment unchanged.
+        pass
+
+
+# Ensure ElementId exposes IntegerValue for downstream scripts like Boundary.py
+_ensure_elementid_integervalue_alias()
+
+
 def get_element_name(elem):
     """Safely get an element/type name across Revit/IronPython versions."""
     # Try standard Name property
