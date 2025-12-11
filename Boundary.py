@@ -715,14 +715,6 @@ def create_area_boundaries_from_floor(doc, view, floor):
     logger.info("Created %s floor-outline area boundary segments (offset 5mm inside).",
                 created_count)
 
-    TaskDialog.Show(
-        "Area Boundary From Floor",
-        "No non-tree plants found in this floor.\n"
-        "Created {0} area boundary segments (offset 5 mm inside the floor edge).\n"
-        "Tree trunk circles (area boundaries) were drawn where applicable."
-        .format(created_count)
-    )
-
     return True
 
 
