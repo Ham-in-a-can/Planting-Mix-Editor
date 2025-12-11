@@ -2397,6 +2397,31 @@ class MixWindowController(object):
                             bs.main()
                     else:
                         bs.main()
+                except AttributeError as ex:
+                    # Retry once after ensuring ElementId compatibility for
+                    # Boundary.py (seen when the command is run outside a
+                    # design option but targets a floor inside one).
+                    if 'IntegerValue' in _to_unicode(ex):
+                        try:
+                            _ensure_elementid_integervalue_alias()
+                        except Exception:
+                            pass
+                        try:
+                            reload(bs)
+                        except Exception:
+                            pass
+                        try:
+                            if mix_name:
+                                try:
+                                    bs.main(mix_name)
+                                except TypeError:
+                                    bs.main()
+                            else:
+                                bs.main()
+                            return
+                        except Exception:
+                            pass
+                    # Fall through to show the alert below
                 except Exception as ex:
                     forms.alert(
                         u'Boundary.py raised an error:\n{0}'.format(ex),
