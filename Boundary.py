@@ -63,6 +63,19 @@ def get_any_3d_view(doc):
     return None
 
 
+def get_element_id_value(element_id):
+    """Return integer value for an ElementId across Revit versions."""
+    try:
+        return element_id.IntegerValue
+    except Exception:
+        pass
+    try:
+        return element_id.Value
+    except Exception:
+        pass
+    return int(element_id)
+
+
 def get_floor_below_point(doc, pickpoint):
     """Use a vertical raycast to find the nearest Floor below the picked point."""
     view3d = get_any_3d_view(doc)
@@ -267,7 +280,7 @@ def delete_existing_boundaries_in_region(doc, view, minx, maxx, miny, maxy, boun
         cat = ce.Category
         if not cat:
             continue
-        cid = cat.Id.IntegerValue
+        cid = get_element_id_value(cat.Id)
         if cid != bic_scheme and (bic_boundary is None or cid != bic_boundary):
             continue
 
