@@ -165,6 +165,59 @@ def fr_debug(msg):
 from Autodesk.Revit.DB import BuiltInParameter  # if not already imported
 
 
+def _get_element_id_int(eid):
+    """Return a best-effort integer value for a Revit ElementId across versions."""
+    if eid is None:
+        return None
+
+    try:
+        return eid.IntegerValue
+    except Exception:
+        pass
+
+    # Revit 2026+ exposes ElementId.Value instead of IntegerValue
+    try:
+        return eid.Value
+    except Exception:
+        pass
+
+    try:
+        return int(eid)
+    except Exception:
+        return None
+
+
+def _ensure_elementid_integervalue_alias():
+    """Expose ElementId.IntegerValue on newer Revit versions that use Value."""
+    try:
+        # If the attribute already exists, nothing to do.
+        if hasattr(DB.ElementId, 'IntegerValue'):
+            return
+
+        def _get_integer_value(self):
+            try:
+                return self.Value
+            except Exception:
+                try:
+                    return int(self)
+                except Exception:
+                    return None
+
+        # Attach a Python property as a compatibility alias.
+        try:
+            DB.ElementId.IntegerValue = property(_get_integer_value)
+        except Exception:
+            # Fallback: attach a simple attribute if property assignment fails.
+            setattr(DB.ElementId, 'IntegerValue', _get_integer_value)
+    except Exception:
+        # Best-effort; if we cannot patch, leave the environment unchanged.
+        pass
+
+
+# Ensure ElementId exposes IntegerValue for downstream scripts like Boundary.py
+_ensure_elementid_integervalue_alias()
+
+
 def get_element_name(elem):
     """Safely get an element/type name across Revit/IronPython versions."""
     # Try standard Name property
@@ -411,8 +464,9 @@ def _get_color_entry_keys(entry):
     else:
         try:
             eid = entry.GetElementIdValue()
-            if eid and eid.IntegerValue != -1:
-                val_key = str(eid.IntegerValue)
+            eid_int = _get_element_id_int(eid)
+            if eid_int not in (None, -1):
+                val_key = str(eid_int)
         except Exception:
             val_key = u''
 
@@ -634,7 +688,7 @@ def _set_filled_region_type_color(fr_type, color):
                 u'FR: Updated ForegroundPatternColor on type "{0}" (Id {1}) '
                 u'from {2} to {3}.'.format(
                     get_element_name(fr_type),
-                    fr_type.Id.IntegerValue,
+                    _get_element_id_int(fr_type.Id),
                     before_txt,
                     after_txt
                 )
@@ -644,7 +698,7 @@ def _set_filled_region_type_color(fr_type, color):
             u'FR: Failed to set ForegroundPatternColor on type "{0}" (Id {1}): {2}'
             .format(
                 get_element_name(fr_type),
-                fr_type.Id.IntegerValue,
+                _get_element_id_int(fr_type.Id),
                 ex
             )
         )
@@ -676,7 +730,7 @@ def _ensure_filled_region_for_mix(doc, mix_name, color, host_view):
             type_name,
             mix_name,
             _to_unicode(host_view.Name),
-            host_view.Id.IntegerValue,
+            _get_element_id_int(host_view.Id),
             color.Red, color.Green, color.Blue
         )
     )
@@ -694,7 +748,7 @@ def _ensure_filled_region_for_mix(doc, mix_name, color, host_view):
                 fr_type = t
                 fr_debug(
                     u'FR: Found existing FilledRegionType "{0}" (Id {1}).'
-                    .format(type_name, t.Id.IntegerValue)
+                    .format(type_name, _get_element_id_int(t.Id))
                 )
                 break
         except Exception:
@@ -718,7 +772,7 @@ def _ensure_filled_region_for_mix(doc, mix_name, color, host_view):
                 .format(
                     get_element_name(template),
                     type_name,
-                    fr_type.Id.IntegerValue
+                    _get_element_id_int(fr_type.Id)
                 )
             )
         except Exception as ex:
@@ -740,7 +794,7 @@ def _ensure_filled_region_for_mix(doc, mix_name, color, host_view):
                         fr_debug(
                             u'FR: Resolved existing FilledRegionType "{0}" (Id {1}) '
                             u'after duplicate failure.'
-                            .format(type_name, et.Id.IntegerValue)
+                            .format(type_name, _get_element_id_int(et.Id))
                         )
                         break
                 except Exception:
@@ -764,7 +818,7 @@ def _ensure_filled_region_for_mix(doc, mix_name, color, host_view):
             isinstance(host_view, DB.ViewDetail)):
         fr_debug(
             u'FR: Host view "{0}" (Id {1}) is not detail-capable; skipping strip.'
-            .format(_to_unicode(host_view.Name), host_view.Id.IntegerValue)
+            .format(_to_unicode(host_view.Name), _get_element_id_int(host_view.Id))
         )
         return
 
@@ -775,7 +829,7 @@ def _ensure_filled_region_for_mix(doc, mix_name, color, host_view):
         col_fr = []
     for fr in col_fr:
         try:
-            if fr.GetTypeId().IntegerValue == fr_type.Id.IntegerValue:
+            if _get_element_id_int(fr.GetTypeId()) == _get_element_id_int(fr_type.Id):
                 fr_debug(
                     u'FR: Existing strip already present for type "{0}".'
                     .format(type_name)
@@ -807,7 +861,7 @@ def _ensure_filled_region_for_mix(doc, mix_name, color, host_view):
         fr = DB.FilledRegion.Create(doc, fr_type.Id, host_view.Id, loops)
         fr_debug(
             u'FR: Created strip Id {0} of type "{1}" in view "{2}".'
-            .format(fr.Id.IntegerValue, type_name, _to_unicode(host_view.Name))
+            .format(_get_element_id_int(fr.Id), type_name, _to_unicode(host_view.Name))
         )
     except Exception as ex:
         fr_debug(
@@ -1177,8 +1231,9 @@ class MixWindowController(object):
                     view_id = fi.OwnerViewId
                 except Exception:
                     view_id = None
-                if view_id and view_id.IntegerValue != -1:
-                    key = view_id.IntegerValue
+                view_key = _get_element_id_int(view_id)
+                if view_key not in (None, -1):
+                    key = view_key
                     if key in view_counts:
                         view_counts[key] += 1
                     else:
@@ -1243,7 +1298,8 @@ class MixWindowController(object):
             by_cat = []
             for scheme in schemes:
                 try:
-                    if scheme.CategoryId and scheme.CategoryId.IntegerValue == cat_id.IntegerValue:
+                    if (_get_element_id_int(scheme.CategoryId)
+                            == _get_element_id_int(cat_id)):
                         by_cat.append(scheme)
                 except Exception:
                     pass
@@ -2341,6 +2397,31 @@ class MixWindowController(object):
                             bs.main()
                     else:
                         bs.main()
+                except AttributeError as ex:
+                    # Retry once after ensuring ElementId compatibility for
+                    # Boundary.py (seen when the command is run outside a
+                    # design option but targets a floor inside one).
+                    if 'IntegerValue' in _to_unicode(ex):
+                        try:
+                            _ensure_elementid_integervalue_alias()
+                        except Exception:
+                            pass
+                        try:
+                            reload(bs)
+                        except Exception:
+                            pass
+                        try:
+                            if mix_name:
+                                try:
+                                    bs.main(mix_name)
+                                except TypeError:
+                                    bs.main()
+                            else:
+                                bs.main()
+                            return
+                        except Exception:
+                            pass
+                    # Fall through to show the alert below
                 except Exception as ex:
                     forms.alert(
                         u'Boundary.py raised an error:\n{0}'.format(ex),
