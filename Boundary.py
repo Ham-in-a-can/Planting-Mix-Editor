@@ -251,6 +251,21 @@ def delete_existing_boundaries_in_region(doc, view, minx, maxx, miny, maxy, boun
     the mix boundary line style. If boundary_style is None, delete all
     AreaScheme/AreaBoundary curves in that region (last-resort fallback).
     """
+    def _safe_int_id(elemid):
+        """Return an integer id value from an ElementId, regardless of API property name."""
+        if elemid is None:
+            return None
+        # Revit API changed some ElementId property exposure under CPython.
+        for attr in ("IntegerValue", "Value"):
+            try:
+                return getattr(elemid, attr)
+            except AttributeError:
+                continue
+        try:
+            return int(elemid)
+        except Exception:
+            return None
+
     ids_to_delete = List[DB.ElementId]()
 
     collector = DB.FilteredElementCollector(doc, view.Id).OfClass(DB.CurveElement)
@@ -267,7 +282,9 @@ def delete_existing_boundaries_in_region(doc, view, minx, maxx, miny, maxy, boun
         cat = ce.Category
         if not cat:
             continue
-        cid = cat.Id.IntegerValue
+        cid = _safe_int_id(cat.Id)
+        if cid is None:
+            continue
         if cid != bic_scheme and (bic_boundary is None or cid != bic_boundary):
             continue
 
@@ -697,14 +714,6 @@ def create_area_boundaries_from_floor(doc, view, floor):
 
     logger.info("Created %s floor-outline area boundary segments (offset 5mm inside).",
                 created_count)
-
-    TaskDialog.Show(
-        "Area Boundary From Floor",
-        "No non-tree plants found in this floor.\n"
-        "Created {0} area boundary segments (offset 5 mm inside the floor edge).\n"
-        "Tree trunk circles (area boundaries) were drawn where applicable."
-        .format(created_count)
-    )
 
     return True
 
