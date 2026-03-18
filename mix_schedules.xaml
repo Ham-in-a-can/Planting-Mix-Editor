@@ -4,8 +4,8 @@
         Title="Mix Schedules"
         WindowStartupLocation="CenterScreen"
         SizeToContent="WidthAndHeight"
-        MinWidth="600"
-        Width="600"
+        MinWidth="760"
+        Width="760"
         MaxHeight="800"
         Background="#FFF9F9F9"
         ResizeMode="CanResizeWithGrip">
