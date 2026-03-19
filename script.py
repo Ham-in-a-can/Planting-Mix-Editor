@@ -2769,10 +2769,19 @@ class MixWindowController(object):
             common    = _to_unicode(row_data.get('Common', u''))
             percent   = row_data.get('Percent', None)
             grade     = row_data.get('Grade', None)
+            is_groundcover = row_data.get('IsGroundcover', None)
+            is_tree = row_data.get('IsTree', None)
 
             row.code = code
             row.bot  = botanical
             row.com  = common
+
+            if is_groundcover not in (None, u'', ''):
+                row.is_groundcover = _coerce_yes_no_to_bool(is_groundcover, default=True)
+            elif is_tree not in (None, u'', ''):
+                row.is_groundcover = not _coerce_yes_no_to_bool(is_tree, default=False)
+            else:
+                row.is_groundcover = True
 
             # Spacing from SpreadMM (mm) -> display string (e.g. '3m')
             if spread_mm not in (None, u''):
