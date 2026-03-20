@@ -66,7 +66,7 @@ LOGGER = script.get_logger()
 # Global configuration
 # -----------------------------
 FAMILY_NAME = 'bm_massed_mix'            # Generic Annotation family to target
-MAX_SPECIES = 15                         # Max species rows supported
+MAX_SPECIES = 30                         # Max species rows supported
 
 # UI behaviour for long Botanical / Common names
 # NAME_FADE_FRACTION = fraction (0–1) of cell width used for fade at right edge
@@ -2832,7 +2832,7 @@ class MixWindowController(object):
 
             base_x_mm = 1567.922
             base_y_mm = 2686.130
-            offset_per_mix_mm = 325.0
+            offset_per_mix_mm = 360.0
 
             position_index = len(self.mixes)
             x_mm = base_x_mm + offset_per_mix_mm * position_index
@@ -2910,7 +2910,7 @@ class MixWindowController(object):
 
             base_x_mm = 1567.922
             base_y_mm = 2686.130
-            offset_per_mix_mm = 325.0
+            offset_per_mix_mm = 360.0
 
             position_index = len(self.mixes)
             x_mm = base_x_mm + offset_per_mix_mm * position_index
