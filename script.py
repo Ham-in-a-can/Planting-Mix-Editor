@@ -66,7 +66,7 @@ LOGGER = script.get_logger()
 # Global configuration
 # -----------------------------
 FAMILY_NAME = 'bm_massed_mix'            # Generic Annotation family to target
-MAX_SPECIES = 15                         # Max species rows supported
+MAX_SPECIES = 30                         # Max species rows supported
 
 # UI behaviour for long Botanical / Common names
 # NAME_FADE_FRACTION = fraction (0–1) of cell width used for fade at right edge
@@ -81,6 +81,8 @@ DEFAULT_MIX_DRAFTING_VIEW_NAME = 'Massed Planting Mixes'
 
 # Icon used for the "Duplicate mix" button (in the pushbutton folder)
 DUPLICATE_ICON_NAME = 'duplicate_icon_hover.png'
+GROUNDCOVER_ICON_NAME = 'Groundcover.png'
+TREE_ICON_NAME = 'Tree.png'
 
 PARAM_MIX_NAME = 'Mix Name'
 PARAM_NUM_SPECIES = 'Num_Species'
@@ -92,6 +94,7 @@ PARAM_SPECIES_SPACE_TEMPLATE = 'S{0}_Space'  # S1_Space, S2_Space, ...
 PARAM_SPECIES_BOT_TEMPLATE   = 'S{0}_Bot'    # S1_Bot, S2_Bot, ...
 PARAM_SPECIES_COM_TEMPLATE   = 'S{0}_Com'    # S1_Com, S2_Com, ...
 PARAM_SPECIES_GRADE_TEMPLATE = 'S{0}_Grade'  # S1_Grade, S2_Grade, ...
+PARAM_SPECIES_GROUNDCOVER_TEMPLATE = 'S{0}_Groundcover'  # S1_Groundcover, ...
 
 # Area name parameter (instance) for all Areas
 AREA_NAME_PARAM = 'Name'
@@ -140,6 +143,8 @@ except Exception:
 
 XAML_FILE = os.path.join(SCRIPT_DIR, 'mix_schedules.xaml')
 DUPLICATE_ICON_PATH = os.path.join(SCRIPT_DIR, DUPLICATE_ICON_NAME)
+GROUNDCOVER_ICON_PATH = os.path.join(SCRIPT_DIR, GROUNDCOVER_ICON_NAME)
+TREE_ICON_PATH = os.path.join(SCRIPT_DIR, TREE_ICON_NAME)
 
 
 # -----------------------------
@@ -978,8 +983,35 @@ def space_display_to_raw(display):
 # -----------------------------
 # Data models
 # -----------------------------
+def _coerce_yes_no_to_bool(value, default=True):
+    """Interpret a Revit Yes/No-ish value as a Python bool."""
+    if value in (None, u'', ''):
+        return default
+
+    s = _to_unicode(value).strip().lower()
+    if s in (u'1', u'true', u'yes', u'y'):
+        return True
+    if s in (u'0', u'false', u'no', u'n'):
+        return False
+    return default
+
+
+def _load_bitmap_image(path):
+    """Best-effort image loader for local PNG assets."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        bmp = BitmapImage()
+        bmp.BeginInit()
+        bmp.UriSource = Uri(path)
+        bmp.EndInit()
+        return bmp
+    except Exception:
+        return None
+
+
 class SpeciesRow(object):
-    def __init__(self, index, code, pct, spacing, bot, com, grade):
+    def __init__(self, index, code, pct, spacing, bot, com, grade, is_groundcover=True):
         self.index = index
         self.code = code or u''
         self.pct = pct or u''
@@ -987,6 +1019,7 @@ class SpeciesRow(object):
         self.bot = bot or u''
         self.com = com or u''
         self.grade = grade or u''
+        self.is_groundcover = is_groundcover
 
 
 class MixModel(object):
@@ -1029,6 +1062,8 @@ class MixModel(object):
         self.area_color_dbcolor = None        # Original Revit.DB.Color from scheme
         self.area_color_new_dbcolor = None    # Pending new color to push on Apply
         self.area_color_border = None         # WPF Border used for colour swatch UI
+        self.groundcover_icon = _load_bitmap_image(GROUNDCOVER_ICON_PATH)
+        self.tree_icon = _load_bitmap_image(TREE_ICON_PATH)
 
     def _load_rows(self):
         self.rows = []
@@ -1039,6 +1074,7 @@ class MixModel(object):
             bot_name   = PARAM_SPECIES_BOT_TEMPLATE.format(i)
             com_name   = PARAM_SPECIES_COM_TEMPLATE.format(i)
             grade_name = PARAM_SPECIES_GRADE_TEMPLATE.format(i)
+            groundcover_name = PARAM_SPECIES_GROUNDCOVER_TEMPLATE.format(i)
 
             code_raw  = get_param(self.element, code_name)
             pct_raw   = get_param(self.element, pct_name)
@@ -1046,11 +1082,17 @@ class MixModel(object):
             bot       = get_param(self.element, bot_name)
             com       = get_param(self.element, com_name)
             grade     = get_param(self.element, grade_name)
+            groundcover_raw = get_param(self.element, groundcover_name)
 
             pct_display = pct_raw_to_display(pct_raw)
             space_display = space_raw_to_display(space_raw)
 
-            self.rows.append(SpeciesRow(i, code_raw, pct_display, space_display, bot, com, grade))
+            self.rows.append(
+                SpeciesRow(
+                    i, code_raw, pct_display, space_display, bot, com, grade,
+                    _coerce_yes_no_to_bool(groundcover_raw, default=True)
+                )
+            )
 
     def remove_row_at(self, index):
         if index < 0 or index >= len(self.rows):
@@ -1065,7 +1107,7 @@ class MixModel(object):
         if len(self.rows) >= MAX_SPECIES:
             return
         new_index = len(self.rows) + 1
-        self.rows.append(SpeciesRow(new_index, u'', u'', u'', u'', u'', u''))
+        self.rows.append(SpeciesRow(new_index, u'', u'', u'', u'', u'', u'', True))
         self.num_species = len(self.rows)
         self.dirty = True
 
@@ -1649,6 +1691,8 @@ class MixWindowController(object):
             return
 
         total = 0.0
+        groundcover_total = 0.0
+        tree_total = 0.0
         for row in mix.rows:
             raw = pct_display_to_raw(row.pct)
             if not raw:
@@ -1658,26 +1702,61 @@ class MixWindowController(object):
             except Exception:
                 continue
             total += val
+            if getattr(row, 'is_groundcover', True):
+                groundcover_total += val
+            else:
+                tree_total += val
 
-        diff = total - 100.0
-        if abs(diff) < 0.5:
-            sb.Text = u''
-            sb.Visibility = Visibility.Collapsed
-            return
+        has_trees = tree_total > 0.0001
 
-        abs_diff = abs(diff)
-        int_diff = int(round(abs_diff))
-        if abs(abs_diff - int_diff) < 1e-6:
-            diff_str = u'{0}%'.format(int_diff)
+        summary_runs = []
+
+        def _format_percent(value):
+            int_val = int(round(value))
+            if abs(value - int_val) < 1e-6:
+                return u'{0}%'.format(int_val)
+            return (u'%.1f%%' % value)
+
+        def _append_run(text, brush):
+            run = System.Windows.Documents.Run()
+            run.Text = text
+            run.Foreground = brush
+            summary_runs.append(run)
+
+        sb.Inlines.Clear()
+
+        if has_trees:
+            gc_diff = groundcover_total - 100.0
+            if abs(gc_diff) < 0.5:
+                gc_text = u'Groundcover ' + _format_percent(groundcover_total)
+                gc_brush = Media.Brushes.DimGray
+            elif gc_diff > 0:
+                gc_text = u'Groundcover Surplus ' + _format_percent(abs(gc_diff))
+                gc_brush = Media.Brushes.ForestGreen
+            else:
+                gc_text = u'Groundcover Deficit ' + _format_percent(abs(gc_diff))
+                gc_brush = Media.Brushes.IndianRed
+            _append_run(gc_text, gc_brush)
+
+            _append_run(u'  |  ', Media.Brushes.DimGray)
+
+            tree_brush = Media.Brushes.ForestGreen if tree_total <= 100.0 + 1e-6 else Media.Brushes.IndianRed
+            _append_run(u'Tree Coverage ' + _format_percent(tree_total), tree_brush)
         else:
-            diff_str = (u'%.1f%%' % abs_diff)
+            diff = total - 100.0
+            if abs(diff) < 0.5:
+                sb.Text = u''
+                sb.Visibility = Visibility.Collapsed
+                return
 
-        if diff > 0:
-            sb.Text = diff_str + u' surplus'
-            sb.Foreground = Media.Brushes.ForestGreen
-        else:
-            sb.Text = diff_str + u' deficit'
-            sb.Foreground = Media.Brushes.IndianRed
+            abs_diff = abs(diff)
+            if diff > 0:
+                _append_run(_format_percent(abs_diff) + u' surplus', Media.Brushes.ForestGreen)
+            else:
+                _append_run(_format_percent(abs_diff) + u' deficit', Media.Brushes.IndianRed)
+
+        for run in summary_runs:
+            sb.Inlines.Add(run)
 
         sb.Visibility = Visibility.Visible
 
@@ -1795,7 +1874,7 @@ class MixWindowController(object):
 
         # --- Header row for species table ---
         header_grid = Grid()
-        for _ in range(7):  # Code, Percent, Spacing, Bot, Com, Grade, minus
+        for _ in range(8):  # Code, Percent, Spacing, Bot, Com, Grade, toggle, minus
             header_grid.ColumnDefinitions.Add(ColumnDefinition())
 
         header_grid.ColumnDefinitions[0].Width = GridLength(60)   # Code
@@ -1804,10 +1883,11 @@ class MixWindowController(object):
         header_grid.ColumnDefinitions[3].Width = GridLength(1, GridUnitType.Star)  # Bot
         header_grid.ColumnDefinitions[4].Width = GridLength(1, GridUnitType.Star)  # Com
         header_grid.ColumnDefinitions[5].Width = GridLength(45)   # Grade
-        header_grid.ColumnDefinitions[6].Width = GridLength(26)   # Minus
+        header_grid.ColumnDefinitions[6].Width = GridLength(30)   # Toggle
+        header_grid.ColumnDefinitions[7].Width = GridLength(26)   # Minus
 
         labels = [u'Code', u'Percent', u'Spacing',
-                  u'Botanical Name', u'Common Name', u'Grade', u'']
+                  u'Botanical Name', u'Common Name', u'Grade', u'', u'']
         for idx, text in enumerate(labels):
             tb = TextBlock()
             tb.Text = text
@@ -1822,7 +1902,7 @@ class MixWindowController(object):
         # --- Data rows ---
         for row_index, row in enumerate(mix.rows):
             row_grid = Grid()
-            for _ in range(7):
+            for _ in range(8):
                 row_grid.ColumnDefinitions.Add(ColumnDefinition())
 
             row_grid.ColumnDefinitions[0].Width = GridLength(60)
@@ -1831,7 +1911,8 @@ class MixWindowController(object):
             row_grid.ColumnDefinitions[3].Width = GridLength(1, GridUnitType.Star)
             row_grid.ColumnDefinitions[4].Width = GridLength(1, GridUnitType.Star)
             row_grid.ColumnDefinitions[5].Width = GridLength(45)
-            row_grid.ColumnDefinitions[6].Width = GridLength(26)
+            row_grid.ColumnDefinitions[6].Width = GridLength(30)
+            row_grid.ColumnDefinitions[7].Width = GridLength(26)
 
             code_box = TextBox()
             code_box.Text = row.code
@@ -2033,17 +2114,43 @@ class MixWindowController(object):
             Grid.SetColumn(grade_box, 5)
             row_grid.Children.Add(grade_box)
 
+            toggle_btn = Button()
+            toggle_btn.Width = 24
+            toggle_btn.Height = 20
+            toggle_btn.Margin = Thickness(0, 0, 4, 2)
+            toggle_btn.Padding = Thickness(0)
+            toggle_btn.Background = Media.Brushes.WhiteSmoke
+            toggle_btn.BorderBrush = Media.Brushes.LightGray
+            toggle_btn.ToolTip = u'Toggle between Ground cover and Tree species'
+            toggle_btn.Tag = (mix, row_index)
+            toggle_btn.Click += self.on_toggle_groundcover
+
+            toggle_img = Image()
+            toggle_img.Width = 14
+            toggle_img.Height = 14
+            toggle_img.Stretch = Media.Stretch.Uniform
+            if getattr(row, 'is_groundcover', True):
+                toggle_img.Source = mix.groundcover_icon
+            else:
+                toggle_img.Source = mix.tree_icon
+            if toggle_img.Source is not None:
+                toggle_btn.Content = toggle_img
+            else:
+                toggle_btn.Content = u'G' if getattr(row, 'is_groundcover', True) else u'T'
+            Grid.SetColumn(toggle_btn, 6)
+            row_grid.Children.Add(toggle_btn)
+
             minus_btn = Button()
             minus_btn.Content = u'−'
             minus_btn.Width = 20
             minus_btn.Height = 20
-            minus_btn.Margin = Thickness(4, 0, 0, 2)
+            minus_btn.Margin = Thickness(0, 0, 0, 2)
             minus_btn.Foreground = Media.Brushes.White
             minus_btn.Background = Media.Brushes.IndianRed
             minus_btn.BorderBrush = Media.Brushes.Transparent
             minus_btn.Tag = (mix, row_index)
             minus_btn.Click += self.on_remove_row
-            Grid.SetColumn(minus_btn, 6)
+            Grid.SetColumn(minus_btn, 7)
             row_grid.Children.Add(minus_btn)
 
             body.Children.Add(row_grid)
@@ -2520,6 +2627,17 @@ class MixWindowController(object):
         mix.remove_row_at(row_index)
         self._render_mix_body(mix)
 
+    def on_toggle_groundcover(self, sender, args):
+        tag = getattr(sender, 'Tag', None)
+        if not tag:
+            return
+        mix, row_index = tag
+        if 0 <= row_index < len(mix.rows):
+            row = mix.rows[row_index]
+            row.is_groundcover = not getattr(row, 'is_groundcover', True)
+            mix.dirty = True
+            self._render_mix_body(mix)
+
     def on_add_row(self, sender, args):
         mix = sender.Tag
         if mix is None:
@@ -2651,10 +2769,19 @@ class MixWindowController(object):
             common    = _to_unicode(row_data.get('Common', u''))
             percent   = row_data.get('Percent', None)
             grade     = row_data.get('Grade', None)
+            is_groundcover = row_data.get('IsGroundcover', None)
+            is_tree = row_data.get('IsTree', None)
 
             row.code = code
             row.bot  = botanical
             row.com  = common
+
+            if is_groundcover not in (None, u'', ''):
+                row.is_groundcover = _coerce_yes_no_to_bool(is_groundcover, default=True)
+            elif is_tree not in (None, u'', ''):
+                row.is_groundcover = not _coerce_yes_no_to_bool(is_tree, default=False)
+            else:
+                row.is_groundcover = True
 
             # Spacing from SpreadMM (mm) -> display string (e.g. '3m')
             if spread_mm not in (None, u''):
@@ -2705,7 +2832,7 @@ class MixWindowController(object):
 
             base_x_mm = 1567.922
             base_y_mm = 2686.130
-            offset_per_mix_mm = 325.0
+            offset_per_mix_mm = 360.0
 
             position_index = len(self.mixes)
             x_mm = base_x_mm + offset_per_mix_mm * position_index
@@ -2783,7 +2910,7 @@ class MixWindowController(object):
 
             base_x_mm = 1567.922
             base_y_mm = 2686.130
-            offset_per_mix_mm = 325.0
+            offset_per_mix_mm = 360.0
 
             position_index = len(self.mixes)
             x_mm = base_x_mm + offset_per_mix_mm * position_index
@@ -2819,8 +2946,9 @@ class MixWindowController(object):
                 bot_name   = PARAM_SPECIES_BOT_TEMPLATE.format(i)
                 com_name   = PARAM_SPECIES_COM_TEMPLATE.format(i)
                 grade_name = PARAM_SPECIES_GRADE_TEMPLATE.format(i)
+                groundcover_name = PARAM_SPECIES_GROUNDCOVER_TEMPLATE.format(i)
 
-                for pname in (code_name, pct_name, space_name, bot_name, com_name, grade_name):
+                for pname in (code_name, pct_name, space_name, bot_name, com_name, grade_name, groundcover_name):
                     copy_param_between_elements(mix.element, new_inst, pname)
 
             t.Commit()
@@ -2968,6 +3096,7 @@ class MixWindowController(object):
                     bot_name   = PARAM_SPECIES_BOT_TEMPLATE.format(i)
                     com_name   = PARAM_SPECIES_COM_TEMPLATE.format(i)
                     grade_name = PARAM_SPECIES_GRADE_TEMPLATE.format(i)
+                    groundcover_name = PARAM_SPECIES_GROUNDCOVER_TEMPLATE.format(i)
 
                     if i <= num:
                         row = mix.rows[i - 1]
@@ -2983,6 +3112,7 @@ class MixWindowController(object):
                         bot_val = row.bot or u''
                         com_val = row.com or u''
                         grade_val = row.grade or u''
+                        groundcover_val = 1 if getattr(row, 'is_groundcover', True) else 0
                     else:
                         code_val = u''
                         pct_val = u''
@@ -2990,12 +3120,14 @@ class MixWindowController(object):
                         bot_val = u''
                         com_val = u''
                         grade_val = u''
+                        groundcover_val = 1
 
                     set_param(mix.element, code_name,  code_val)
                     set_param(mix.element, pct_name,   pct_val)
                     set_param(mix.element, bot_name,   bot_val)
                     set_param(mix.element, com_name,   com_val)
                     set_param(mix.element, grade_name, grade_val)
+                    set_param(mix.element, groundcover_name, groundcover_val)
 
                     try:
                         p_space = mix.element.LookupParameter(space_name)
