@@ -876,10 +876,18 @@ def _ensure_filled_region_for_mix(doc, mix_name, color, host_view):
 
 # ---- Percent conversions ----
 def pct_raw_to_display(raw):
-    """Convert stored decimal or percent-ish value to '50%' style string."""
+    """Convert stored decimal or percent value to a display string like '50%'.
+
+    Revit percentage parameters are stored internally as decimal fractions
+    (0.5 = 50%), but AsValueString often returns text that already includes
+    a percent sign (for example '1%'). Values that already look like percent
+    text must be displayed exactly as percent values; otherwise '1%' would be
+    interpreted as an internal decimal and incorrectly shown as '100%'.
+    """
     s = _to_unicode(raw).strip()
     if not s:
         return u''
+    has_percent_sign = u'%' in s
     s = s.replace(u'%', u'').replace(u',', u'.')
     cleaned = []
     for ch in s:
@@ -892,7 +900,9 @@ def pct_raw_to_display(raw):
         val = float(s_num)
     except Exception:
         return u''
-    if val <= 1.0 + 1e-9:
+    if has_percent_sign:
+        perc = val
+    elif abs(val) < 1.0 - 1e-9:
         perc = val * 100.0
     else:
         perc = val
@@ -905,7 +915,11 @@ def pct_raw_to_display(raw):
 
 
 def pct_display_to_raw(display):
-    """Convert user display like '50%' or '50' or '0.5' into decimal string '0.5'."""
+    """Convert user-entered percent text into Revit's decimal percentage.
+
+    Species percentages are entered as displayed percent values. Therefore
+    '1', '1%', and '0.5' mean 1%, 1%, and 0.5% respectively, not 100% or 50%.
+    """
     s = _to_unicode(display).strip()
     if not s:
         return u''
@@ -921,11 +935,8 @@ def pct_display_to_raw(display):
         val = float(s_num)
     except Exception:
         return u''
-    if val > 1.0 + 1e-9:
-        raw = val / 100.0
-    else:
-        raw = val
-    raw_str = (u'%.4f' % raw).rstrip('0').rstrip('.')
+    raw = val / 100.0
+    raw_str = (u'%.6f' % raw).rstrip('0').rstrip('.')
     if not raw_str:
         raw_str = u'0'
     return raw_str
