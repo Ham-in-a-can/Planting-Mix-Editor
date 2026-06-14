@@ -127,6 +127,14 @@ FILLED_REGION_HEIGHT_MM = 4.0
 # Debug: set True while trying to understand filled region behaviour
 DEBUG_FILLED_REGION = False
 
+# Module-level holder for the asynchronous native Area Boundary drawing
+# workflow. pyRevit/IronPython event handlers must be kept alive after the
+# command returns, so the session stores the handler references until Idling
+# completes or cancels the workflow.
+_DRAW_AREA_SESSION = None
+DRAW_AREA_MAX_IDLE_WITHOUT_LINES = 25
+DRAW_AREA_MAX_IDLE_WITH_LINES = 8
+
 #Path to plant library script
 CREATE_PLANT_SCRIPT_PATH = r"C:\Users\hamishc\OneDrive - Boffa Miskell\Desktop\Shared_Dynamo\ToolBar\OnServer\BoffaTestTools.extension\BoffaTools.tab\Test.panel\Create Plant.pushbutton\script.py"
 
@@ -379,6 +387,234 @@ def set_param(element, name, value):
         # swallow errors rather than killing the UI
         pass
 
+
+
+
+def is_area_plan_view(view):
+    """Return True when view can host native Area Boundary lines and Areas."""
+    try:
+        return isinstance(view, DB.ViewPlan) and view.ViewType == DB.ViewType.AreaPlan
+    except Exception:
+        try:
+            return view.ViewType == DB.ViewType.AreaPlan
+        except Exception:
+            return False
+
+
+def get_mix_boundary_linestyle(doc):
+    """Get or create the BM Mix Boundary line style for Area Boundary lines."""
+    cats = doc.Settings.Categories
+    try:
+        cat = cats.get_Item(DB.BuiltInCategory.OST_AreaSchemeLines)
+    except Exception:
+        cat = None
+    if cat is None:
+        return None
+
+    for sub in cat.SubCategories:
+        try:
+            if sub.Name == u'BM Mix Boundary':
+                return sub.GetGraphicsStyle(DB.GraphicsStyleType.Projection)
+        except Exception:
+            pass
+
+    try:
+        new_sub = cats.NewSubcategory(cat, u'BM Mix Boundary')
+        return new_sub.GetGraphicsStyle(DB.GraphicsStyleType.Projection)
+    except Exception:
+        return None
+
+
+def _is_area_boundary_element(elem, view_id):
+    """Best-effort check for Area Boundary / Area Scheme line elements."""
+    if elem is None:
+        return False
+    try:
+        if elem.OwnerViewId != view_id:
+            return False
+    except Exception:
+        pass
+    try:
+        cat = elem.Category
+        if cat is not None and cat.Id == DB.ElementId(DB.BuiltInCategory.OST_AreaSchemeLines):
+            return True
+    except Exception:
+        pass
+    try:
+        bic = int(DB.BuiltInCategory.OST_AreaSchemeLines)
+        if elem.Category is not None and _get_element_id_int(elem.Category.Id) == bic:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _collect_area_boundary_ids_in_view(doc, view_id):
+    ids = set()
+    try:
+        elems = (DB.FilteredElementCollector(doc, view_id)
+                 .OfCategory(DB.BuiltInCategory.OST_AreaSchemeLines)
+                 .WhereElementIsNotElementType()
+                 .ToElements())
+        for elem in elems:
+            try:
+                ids.add(_get_element_id_int(elem.Id))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return ids
+
+
+def _get_curve_endpoints_xy(curve):
+    try:
+        p0 = curve.GetEndPoint(0)
+        p1 = curve.GetEndPoint(1)
+        return (p0.X, p0.Y), (p1.X, p1.Y)
+    except Exception:
+        return None, None
+
+
+def _point_key(pt, tol=0.001):
+    return (int(round(pt[0] / tol)), int(round(pt[1] / tol)))
+
+
+def _loop_area(points):
+    area = 0.0
+    if len(points) < 3:
+        return 0.0
+    for i in range(len(points)):
+        x1, y1 = points[i]
+        x2, y2 = points[(i + 1) % len(points)]
+        area += x1 * y2 - x2 * y1
+    return area / 2.0
+
+
+def _point_in_poly(pt, poly):
+    x, y = pt
+    inside = False
+    n = len(poly)
+    if n < 3:
+        return False
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if ((yi > y) != (yj > y)):
+            try:
+                x_cross = (xj - xi) * (y - yi) / (yj - yi) + xi
+                if x < x_cross:
+                    inside = not inside
+            except Exception:
+                pass
+        j = i
+    return inside
+
+
+def _centroid_or_bbox_point(poly):
+    area = _loop_area(poly)
+    if abs(area) > 1e-9:
+        cx = 0.0
+        cy = 0.0
+        for i in range(len(poly)):
+            x0, y0 = poly[i]
+            x1, y1 = poly[(i + 1) % len(poly)]
+            cross = x0 * y1 - x1 * y0
+            cx += (x0 + x1) * cross
+            cy += (y0 + y1) * cross
+        try:
+            cx = cx / (6.0 * area)
+            cy = cy / (6.0 * area)
+            if _point_in_poly((cx, cy), poly):
+                return (cx, cy)
+        except Exception:
+            pass
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    return ((min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0)
+
+
+def _sample_points_for_loop(poly):
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    minx, maxx = min(xs), max(xs)
+    miny, maxy = min(ys), max(ys)
+    points = [_centroid_or_bbox_point(poly)]
+    for ix in range(1, 4):
+        for iy in range(1, 4):
+            pt = (minx + (maxx - minx) * ix / 4.0,
+                  miny + (maxy - miny) * iy / 4.0)
+            if _point_in_poly(pt, poly):
+                points.append(pt)
+    return points
+
+
+def _build_closed_loops_from_boundary_ids(doc, id_ints):
+    """Build simple endpoint-connected loops from new Area Boundary curves."""
+    segments = []
+    for id_int in id_ints:
+        try:
+            elem = doc.GetElement(DB.ElementId(id_int))
+            curve = elem.GeometryCurve
+        except Exception:
+            continue
+        p0, p1 = _get_curve_endpoints_xy(curve)
+        if p0 is None or p1 is None:
+            continue
+        if _point_key(p0) == _point_key(p1):
+            continue
+        segments.append([p0, p1, False])
+
+    loops = []
+    for seg in segments:
+        if seg[2]:
+            continue
+        seg[2] = True
+        loop = [seg[0], seg[1]]
+        start_key = _point_key(seg[0])
+        end_key = _point_key(seg[1])
+        changed = True
+        while changed and end_key != start_key:
+            changed = False
+            for other in segments:
+                if other[2]:
+                    continue
+                ok0 = _point_key(other[0])
+                ok1 = _point_key(other[1])
+                if ok0 == end_key:
+                    other[2] = True
+                    loop.append(other[1])
+                    end_key = ok1
+                    changed = True
+                    break
+                if ok1 == end_key:
+                    other[2] = True
+                    loop.append(other[0])
+                    end_key = ok0
+                    changed = True
+                    break
+        if end_key == start_key and len(loop) >= 4:
+            loop = loop[:-1]
+            if abs(_loop_area(loop)) > 1e-6:
+                loops.append(loop)
+    loops.sort(key=lambda pts: abs(_loop_area(pts)), reverse=True)
+    return loops
+
+
+def _set_area_name(area, mix_name):
+    try:
+        set_param(area, AREA_NAME_PARAM, mix_name)
+        return True
+    except Exception:
+        pass
+    try:
+        p = area.LookupParameter(AREA_NAME_PARAM)
+        if p:
+            p.Set(mix_name)
+            return True
+    except Exception:
+        pass
+    return False
 
 def copy_param_between_elements(src_elem, dst_elem, param_name):
     """Copy a single parameter value from src_elem to dst_elem by name."""
@@ -990,6 +1226,202 @@ def space_display_to_raw(display):
     mm_int = int(round(mm_val))
     return _to_unicode(mm_int)
 
+
+
+# -----------------------------
+# Native Draw Area event workflow
+# -----------------------------
+
+class DrawAreaSession(object):
+    """State kept alive while Revit's posted Area Boundary command runs."""
+
+    def __init__(self, doc, uidoc, uiapp, view_id, mix_name, existing_ids):
+        self.doc = doc
+        self.uidoc = uidoc
+        self.uiapp = uiapp
+        self.view_id = view_id
+        self.mix_name = mix_name
+        self.existing_ids = existing_ids or set()
+        self.added_ids = set()
+        self.idle_attempts = 0
+        self.idle_with_lines = 0
+        self.doc_changed_handler = None
+        self.idling_handler = None
+        self.completed = False
+
+
+def _draw_area_unsubscribe(session):
+    if session is None:
+        return
+    try:
+        if session.doc_changed_handler is not None:
+            session.uiapp.Application.DocumentChanged -= session.doc_changed_handler
+    except Exception:
+        pass
+    try:
+        if session.idling_handler is not None:
+            session.uiapp.Idling -= session.idling_handler
+    except Exception:
+        pass
+
+
+def _draw_area_reopen_editor(doc):
+    try:
+        controller = MixWindowController(doc)
+        if controller.window is not None:
+            controller.show()
+    except Exception as ex:
+        forms.alert(u'Could not reopen the Mix Schedule Editor:\n{0}'.format(ex),
+                    title='Draw Area')
+
+
+def _draw_area_finish(session, reopen=True):
+    global _DRAW_AREA_SESSION
+    if session is None:
+        return
+    _draw_area_unsubscribe(session)
+    session.completed = True
+    if _DRAW_AREA_SESSION is session:
+        _DRAW_AREA_SESSION = None
+    if reopen:
+        _draw_area_reopen_editor(session.doc)
+
+
+def _draw_area_document_changed(sender, args):
+    """Record Area Boundary ids only; never modify the model in this event."""
+    session = _DRAW_AREA_SESSION
+    if session is None or session.completed:
+        return
+    try:
+        if args.GetDocument() != session.doc:
+            return
+    except Exception:
+        return
+    try:
+        added = args.GetAddedElementIds()
+    except Exception:
+        return
+    for eid in added:
+        try:
+            elem = session.doc.GetElement(eid)
+        except Exception:
+            elem = None
+        if _is_area_boundary_element(elem, session.view_id):
+            id_int = _get_element_id_int(eid)
+            if id_int is not None:
+                session.added_ids.add(id_int)
+
+
+def _draw_area_apply_results(session):
+    doc = session.doc
+    view = doc.GetElement(session.view_id)
+    if not is_area_plan_view(view):
+        forms.alert(u'The active Area Plan is no longer available. The boundary lines were left in place.',
+                    title='Draw Area')
+        return
+
+    ids = set(session.added_ids)
+    if not ids:
+        current = _collect_area_boundary_ids_in_view(doc, session.view_id)
+        ids = current.difference(session.existing_ids)
+    if not ids:
+        return
+
+    loops = _build_closed_loops_from_boundary_ids(doc, ids)
+    if not loops:
+        t = DB.Transaction(doc, 'Style Drawn Mix Area Boundaries')
+        try:
+            t.Start()
+            style = get_mix_boundary_linestyle(doc)
+            if style is not None:
+                for id_int in ids:
+                    try:
+                        elem = doc.GetElement(DB.ElementId(id_int))
+                        elem.LineStyle = style
+                    except Exception:
+                        pass
+            t.Commit()
+        except Exception:
+            try:
+                if t.HasStarted() and not t.HasEnded():
+                    t.RollBack()
+            except Exception:
+                pass
+        forms.alert(u'Area Boundary lines were drawn, but no closed loop could be detected. '
+                    u'The lines were left in place; please place the Area manually or retry with a closed boundary.',
+                    title='Draw Area')
+        return
+
+    placed_count = 0
+    failed_loops = 0
+    t = DB.Transaction(doc, 'Place Drawn Mix Area')
+    try:
+        t.Start()
+        style = get_mix_boundary_linestyle(doc)
+        if style is not None:
+            for id_int in ids:
+                try:
+                    elem = doc.GetElement(DB.ElementId(id_int))
+                    elem.LineStyle = style
+                except Exception:
+                    pass
+
+        for loop in loops:
+            placed = False
+            for x, y in _sample_points_for_loop(loop):
+                try:
+                    area = doc.Create.NewArea(view, DB.UV(x, y))
+                    if area is not None:
+                        _set_area_name(area, session.mix_name)
+                        placed_count += 1
+                        placed = True
+                        break
+                except Exception:
+                    pass
+            if not placed:
+                failed_loops += 1
+
+        t.Commit()
+    except Exception as ex:
+        try:
+            if t.HasStarted() and not t.HasEnded():
+                t.RollBack()
+        except Exception:
+            pass
+        forms.alert(u'Area Boundary lines were drawn, but the Area could not be placed:\n{0}\n\n'
+                    u'The boundary lines were left in place.'.format(ex),
+                    title='Draw Area')
+        return
+
+    if placed_count <= 0:
+        forms.alert(u'Area Boundary lines were drawn, but Revit did not accept any sampled placement point. '
+                    u'The boundary lines were left in place; please place the Area manually.',
+                    title='Draw Area')
+    elif failed_loops > 0:
+        forms.alert(u'Placed {0} Area(s), but {1} detected loop(s) could not receive an Area. '
+                    u'Those boundary lines were left in place.'.format(placed_count, failed_loops),
+                    title='Draw Area')
+
+
+def _draw_area_idling(sender, args):
+    """Process recorded ids after Revit returns to idle from the posted command."""
+    session = _DRAW_AREA_SESSION
+    if session is None or session.completed:
+        return
+
+    if session.added_ids:
+        session.idle_with_lines += 1
+        if session.idle_with_lines < DRAW_AREA_MAX_IDLE_WITH_LINES:
+            return
+    else:
+        session.idle_attempts += 1
+        if session.idle_attempts < DRAW_AREA_MAX_IDLE_WITHOUT_LINES:
+            return
+
+    try:
+        _draw_area_apply_results(session)
+    finally:
+        _draw_area_finish(session, reopen=True)
 
 # -----------------------------
 # Data models
@@ -1815,7 +2247,7 @@ class MixWindowController(object):
         color_grid.ColumnDefinitions.Add(ColumnDefinition())
         color_grid.ColumnDefinitions[0].Width = GridLength(1, GridUnitType.Auto)
         color_grid.ColumnDefinitions[1].Width = GridLength(80)
-        color_grid.ColumnDefinitions[2].Width = GridLength(80)
+        color_grid.ColumnDefinitions[2].Width = GridLength(170)
 
 
         color_label = TextBlock()
@@ -1867,7 +2299,12 @@ class MixWindowController(object):
         Grid.SetColumn(swatch, 1)
         color_grid.Children.Add(swatch)
 
-        # --- Place Area button next to colour swatch ---
+        # --- Place Area / Draw Area buttons next to colour swatch ---
+        area_button_panel = StackPanel()
+        area_button_panel.Orientation = Orientation.Horizontal
+        area_button_panel.HorizontalAlignment = HorizontalAlignment.Left
+        Grid.SetColumn(area_button_panel, 2)
+
         place_btn = Button()
         place_btn.Content = u'Place Area'
         place_btn.FontSize = 10
@@ -1876,8 +2313,19 @@ class MixWindowController(object):
         place_btn.HorizontalAlignment = HorizontalAlignment.Left
         place_btn.Tag = mix
         place_btn.Click += self.on_place_area_click
-        Grid.SetColumn(place_btn, 2)
-        color_grid.Children.Add(place_btn)
+        area_button_panel.Children.Add(place_btn)
+
+        draw_btn = Button()
+        draw_btn.Content = u'Draw Area'
+        draw_btn.FontSize = 10
+        draw_btn.Margin = Thickness(6, 0, 0, 0)
+        draw_btn.Padding = Thickness(4, 0, 4, 0)
+        draw_btn.HorizontalAlignment = HorizontalAlignment.Left
+        draw_btn.Tag = mix
+        draw_btn.Click += self.on_draw_area_click
+        area_button_panel.Children.Add(draw_btn)
+
+        color_grid.Children.Add(area_button_panel)
 
         mix.area_color_border = swatch
         body.Children.Add(color_grid)
@@ -2460,6 +2908,79 @@ class MixWindowController(object):
             sender.Opacity = 1.0
         except Exception:
             pass
+
+
+    def on_draw_area_click(self, sender, args):
+        """Post Revit's native Area Boundary command and place/names Areas after idle."""
+        global _DRAW_AREA_SESSION
+
+        mix = getattr(sender, 'Tag', None)
+        if mix is None:
+            return
+
+        mix_name = getattr(mix, 'mix_name', None)
+        if mix_name is not None:
+            mix_name = _to_unicode(mix_name).strip()
+        if not mix_name:
+            forms.alert(u'This mix does not have a name, so an Area cannot be named.',
+                        title='Draw Area')
+            return
+
+        doc = self.doc
+        uidoc = revit.uidoc
+        try:
+            uiapp = uidoc.Application
+        except Exception:
+            uiapp = None
+        view = doc.ActiveView
+
+        if not is_area_plan_view(view):
+            forms.alert(u'Draw Area must be run from an Area Plan view.\n\n'
+                        u'Open the relevant Area Plan, expand the mix, and click Draw Area again.',
+                        title='Draw Area')
+            return
+        if uiapp is None:
+            forms.alert(u'Could not access the Revit UI application to start Draw Area.',
+                        title='Draw Area')
+            return
+
+        if _DRAW_AREA_SESSION is not None:
+            try:
+                _draw_area_finish(_DRAW_AREA_SESSION, reopen=False)
+            except Exception:
+                _DRAW_AREA_SESSION = None
+
+        existing_ids = _collect_area_boundary_ids_in_view(doc, view.Id)
+        session = DrawAreaSession(doc, uidoc, uiapp, view.Id, mix_name, existing_ids)
+        session.doc_changed_handler = _draw_area_document_changed
+        session.idling_handler = _draw_area_idling
+        _DRAW_AREA_SESSION = session
+
+        try:
+            uiapp.Application.DocumentChanged += session.doc_changed_handler
+            uiapp.Idling += session.idling_handler
+        except Exception as ex:
+            _draw_area_finish(session, reopen=False)
+            forms.alert(u'Could not subscribe to Revit events for Draw Area:\n{0}'.format(ex),
+                        title='Draw Area')
+            return
+
+        try:
+            if self.window is not None:
+                self.window.Close()
+        except Exception:
+            pass
+
+        try:
+            cmd_id = RevitCommandId.LookupPostableCommandId(PostableCommand.AreaBoundary)
+            if cmd_id is None:
+                raise Exception('Area Boundary command id was not found.')
+            uiapp.PostCommand(cmd_id)
+        except Exception as ex:
+            _draw_area_finish(session, reopen=False)
+            forms.alert(u'Could not start Revit Area Boundary drawing command:\n{0}'.format(ex),
+                        title='Draw Area')
+            _draw_area_reopen_editor(doc)
 
     def on_place_area_click(self, sender, args):
         """Run Boundary.py when 'Place Area' is clicked for a mix."""
