@@ -2502,15 +2502,19 @@ class MixWindowController(object):
             uiapp = None
         view = doc.ActiveView
 
-        def _close_editor():
+        # Bind everything the callbacks need as default arguments. pyRevit can
+        # tear down this command module's globals before DrawArea.py receives
+        # the later Idling callback, so late global lookups such as
+        # MixWindowController would otherwise fail when reopening the editor.
+        def _close_editor(window=self.window):
             try:
-                if self.window is not None:
-                    self.window.Close()
+                if window is not None:
+                    window.Close()
             except Exception:
                 pass
 
-        def _reopen_editor(reopen_doc):
-            controller = MixWindowController(reopen_doc)
+        def _reopen_editor(reopen_doc, controller_cls=MixWindowController):
+            controller = controller_cls(reopen_doc)
             if controller.window is not None:
                 controller.show()
 
@@ -2530,7 +2534,7 @@ class MixWindowController(object):
                 mix_name,
                 _close_editor,
                 _reopen_editor,
-                lambda area, name: set_param(area, AREA_NAME_PARAM, name)
+                lambda area, name, setter=set_param, pname=AREA_NAME_PARAM: setter(area, pname, name)
             )
         except Exception as ex:
             forms.alert(u'Draw Area raised an error:\n{0}'.format(ex),
