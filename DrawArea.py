@@ -12,7 +12,7 @@ from Autodesk.Revit.UI import RevitCommandId, PostableCommand
 
 _DRAW_AREA_SESSION = None
 DRAW_AREA_MAX_IDLE_WITHOUT_LINES = 25
-DRAW_AREA_MAX_IDLE_WITH_LINES = 2
+DRAW_AREA_MAX_IDLE_WITH_LINES = 1
 MIX_BOUNDARY_STYLE_NAME = u'BM Mix Boundary'
 AREA_NAME_PARAM = u'Name'
 
@@ -603,6 +603,15 @@ def _draw_area_apply_results(session, progress_bar=None):
 
 def _draw_area_idling(sender, args):
     """Process recorded ids after Revit returns to idle from the posted command."""
+    # Once Revit gives us an Idling callback, ask it to keep raising Idling
+    # without waiting for extra user input. This cannot force the first idle
+    # after the native command, but it avoids an additional click/key press once
+    # Revit has yielded back to the API.
+    try:
+        args.SetRaiseWithoutDelay()
+    except Exception:
+        pass
+
     session = _DRAW_AREA_SESSION
     if session is None or session.completed:
         return
