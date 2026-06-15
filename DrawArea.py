@@ -205,6 +205,75 @@ def _sample_points_for_loop(poly):
     return points
 
 
+
+def _sample_points_from_boundary_ids(doc, id_ints):
+    """Return practical placement candidates around newly drawn boundary lines.
+
+    This supports the common workflow where the user draws only the missing
+    side(s) of a region that is otherwise bounded by existing Area Boundary
+    lines. In that case the newly drawn curves are not a closed loop by
+    themselves, but Revit can still place an Area if we sample inside the
+    completed region near the new work.
+    """
+    pts = []
+    for id_int in id_ints:
+        try:
+            elem = doc.GetElement(DB.ElementId(id_int))
+            curve = elem.GeometryCurve
+        except Exception:
+            continue
+        p0, p1 = _get_curve_endpoints_xy(curve)
+        if p0 is not None:
+            pts.append(p0)
+        if p1 is not None:
+            pts.append(p1)
+
+    if not pts:
+        return []
+
+    xs = [pt[0] for pt in pts]
+    ys = [pt[1] for pt in pts]
+    minx, maxx = min(xs), max(xs)
+    miny, maxy = min(ys), max(ys)
+    width = maxx - minx
+    height = maxy - miny
+    pad = max(width, height) * 0.25
+    if pad < 1.0:
+        pad = 1.0
+    if width < 0.1:
+        minx -= pad
+        maxx += pad
+    if height < 0.1:
+        miny -= pad
+        maxy += pad
+
+    candidates = []
+    seen = set()
+
+    def _add(pt):
+        key = _point_key(pt)
+        if key not in seen:
+            seen.add(key)
+            candidates.append(pt)
+
+    _add(((minx + maxx) / 2.0, (miny + maxy) / 2.0))
+    for ix in range(1, 6):
+        for iy in range(1, 6):
+            _add((minx + (maxx - minx) * ix / 6.0,
+                  miny + (maxy - miny) * iy / 6.0))
+    return candidates
+
+
+def _style_boundary_ids(doc, ids, style):
+    if style is None:
+        return
+    for id_int in ids:
+        try:
+            elem = doc.GetElement(DB.ElementId(id_int))
+            elem.LineStyle = style
+        except Exception:
+            pass
+
 def _build_closed_loops_from_boundary_ids(doc, id_ints):
     """Build simple endpoint-connected loops from new Area Boundary curves."""
     segments = []
@@ -443,17 +512,27 @@ def _draw_area_apply_results(session, progress_bar=None):
     loops = _build_closed_loops_from_boundary_ids(doc, ids)
     _progress_update(progress_bar, 2, 4)
     if not loops:
-        t = DB.Transaction(doc, 'Style Drawn Mix Area Boundaries')
+        # The newly drawn lines might be intentionally open because they close
+        # a region together with existing Area Boundary lines. Style the new
+        # lines, then ask Revit to place an Area at sampled points around the
+        # new work; Revit will accept a point if the total boundary network is
+        # enclosed even when the new lines are not a closed loop by themselves.
+        placed_count = 0
+        candidates = _sample_points_from_boundary_ids(doc, ids)
+        t = DB.Transaction(doc, 'Place Drawn Mix Area')
         try:
             t.Start()
             style = get_mix_boundary_linestyle(doc)
-            if style is not None:
-                for id_int in ids:
-                    try:
-                        elem = doc.GetElement(DB.ElementId(id_int))
-                        elem.LineStyle = style
-                    except Exception:
-                        pass
+            _style_boundary_ids(doc, ids, style)
+            for x, y in candidates:
+                try:
+                    area = doc.Create.NewArea(view, DB.UV(x, y))
+                    if area is not None:
+                        _set_area_name(area, session.mix_name, session.set_area_name_callback)
+                        placed_count += 1
+                        break
+                except Exception:
+                    pass
             t.Commit()
         except Exception:
             try:
@@ -461,9 +540,12 @@ def _draw_area_apply_results(session, progress_bar=None):
                     t.RollBack()
             except Exception:
                 pass
-        forms.alert(u'Area Boundary lines were drawn, but no closed loop could be detected. '
-                    u'The lines were left in place; please place the Area manually or retry with a closed boundary.',
-                    title='Draw Area')
+
+        if placed_count <= 0:
+            forms.alert(u'Area Boundary lines were drawn and styled, but Revit did not find an enclosed '
+                        u'Area at the sampled points. The lines were left in place; if they connect to '
+                        u'existing boundaries, place the Area manually or draw a little farther into the region.',
+                        title='Draw Area')
         return
 
     placed_count = 0
@@ -472,13 +554,7 @@ def _draw_area_apply_results(session, progress_bar=None):
     try:
         t.Start()
         style = get_mix_boundary_linestyle(doc)
-        if style is not None:
-            for id_int in ids:
-                try:
-                    elem = doc.GetElement(DB.ElementId(id_int))
-                    elem.LineStyle = style
-                except Exception:
-                    pass
+        _style_boundary_ids(doc, ids, style)
 
         loop_index = 0
         loop_count = len(loops)
