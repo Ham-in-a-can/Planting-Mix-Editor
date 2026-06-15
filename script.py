@@ -2502,10 +2502,11 @@ class MixWindowController(object):
             uiapp = None
         view = doc.ActiveView
 
-        # Bind everything the callbacks need as default arguments. pyRevit can
-        # tear down this command module's globals before DrawArea.py receives
-        # the later Idling callback, so late global lookups such as
-        # MixWindowController would otherwise fail when reopening the editor.
+        # Bind callback dependencies as default arguments. pyRevit can tear
+        # down this command module's globals before DrawArea.py receives the
+        # later Idling callback, so reopening must load a fresh copy of this
+        # script module instead of reusing the old MixWindowController class
+        # whose methods depend on globals such as DB, forms, and XamlReader.
         def _close_editor(window=self.window):
             try:
                 if window is not None:
@@ -2513,10 +2514,9 @@ class MixWindowController(object):
             except Exception:
                 pass
 
-        def _reopen_editor(reopen_doc, controller_cls=MixWindowController):
-            controller = controller_cls(reopen_doc)
-            if controller.window is not None:
-                controller.show()
+        def _reopen_editor(reopen_doc, script_path=os.path.join(SCRIPT_DIR, 'script.py'), loader=imp.load_source):
+            reopened = loader('mix_schedule_editor_reopen', script_path)
+            reopened.open_mix_editor(reopen_doc)
 
         try:
             if SCRIPT_DIR not in sys.path:
@@ -3298,9 +3298,14 @@ class MixWindowController(object):
             self.window.ShowDialog()
 
 
+def open_mix_editor(doc):
+    controller = MixWindowController(doc)
+    if controller.window is not None:
+        controller.show()
+
+
 # -----------------------------
 # Run
 # -----------------------------
-controller = MixWindowController(revit.doc)
-if controller.window is not None:
-    controller.show()
+if __name__ == '__main__':
+    open_mix_editor(revit.doc)
