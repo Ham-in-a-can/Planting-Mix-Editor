@@ -12,7 +12,7 @@ from Autodesk.Revit.UI import RevitCommandId, PostableCommand
 
 _DRAW_AREA_SESSION = None
 DRAW_AREA_MAX_IDLE_WITHOUT_LINES = 25
-DRAW_AREA_MAX_IDLE_WITH_LINES = 8
+DRAW_AREA_MAX_IDLE_WITH_LINES = 2
 MIX_BOUNDARY_STYLE_NAME = u'BM Mix Boundary'
 AREA_NAME_PARAM = u'Name'
 
@@ -257,21 +257,89 @@ def _build_closed_loops_from_boundary_ids(doc, id_ints):
     return loops
 
 
-def _set_area_name(area, mix_name, set_area_name_callback=None):
-    if set_area_name_callback is not None:
-        try:
-            set_area_name_callback(area, mix_name)
-            return True
-        except Exception:
-            pass
+def _area_name_matches(area, mix_name):
+    expected = _to_unicode(mix_name).strip()
     try:
         p = area.LookupParameter(AREA_NAME_PARAM)
         if p:
-            p.Set(mix_name)
+            current = _to_unicode(p.AsString()).strip()
+            if current == expected:
+                return True
+            current = _to_unicode(p.AsValueString()).strip()
+            if current == expected:
+                return True
+    except Exception:
+        pass
+    try:
+        current = _to_unicode(area.Name).strip()
+        if current == expected:
             return True
     except Exception:
         pass
     return False
+
+
+def _try_set_parameter(param, value):
+    if param is None:
+        return False
+    try:
+        if param.IsReadOnly:
+            return False
+    except Exception:
+        pass
+    try:
+        param.Set(value)
+        return True
+    except Exception:
+        return False
+
+
+def _set_area_name(area, mix_name, set_area_name_callback=None):
+    """Set an Area name robustly across Revit versions/templates.
+
+    The callback from script.py uses its existing set_param helper, but that
+    helper intentionally swallows failures. Always verify the result and then
+    fall back to common Area/SpatialElement name parameters if needed.
+    """
+    mix_name = _to_unicode(mix_name).strip()
+    if not mix_name:
+        return False
+
+    if set_area_name_callback is not None:
+        try:
+            set_area_name_callback(area, mix_name)
+        except Exception:
+            pass
+        if _area_name_matches(area, mix_name):
+            return True
+
+    # Area name is usually the SpatialElement/Room name built-in parameter.
+    for bip_name in ('ROOM_NAME', 'SPACE_NAME'):
+        try:
+            bip = getattr(DB.BuiltInParameter, bip_name)
+            if _try_set_parameter(area.get_Parameter(bip), mix_name):
+                if _area_name_matches(area, mix_name):
+                    return True
+                return True
+        except Exception:
+            pass
+
+    try:
+        if _try_set_parameter(area.LookupParameter(AREA_NAME_PARAM), mix_name):
+            return True
+    except Exception:
+        pass
+
+    return _area_name_matches(area, mix_name)
+
+
+def _progress_update(progress_bar, value, max_value):
+    if progress_bar is None:
+        return
+    try:
+        progress_bar.update_progress(value, max_value)
+    except Exception:
+        pass
 
 
 class DrawAreaSession(object):
@@ -355,13 +423,15 @@ def _draw_area_document_changed(sender, args):
                 session.added_ids.add(id_int)
 
 
-def _draw_area_apply_results(session):
+def _draw_area_apply_results(session, progress_bar=None):
     doc = session.doc
     view = doc.GetElement(session.view_id)
     if not is_area_plan_view(view):
         forms.alert(u'The active Area Plan is no longer available. The boundary lines were left in place.',
                     title='Draw Area')
         return
+
+    _progress_update(progress_bar, 1, 4)
 
     ids = set(session.added_ids)
     if not ids:
@@ -371,6 +441,7 @@ def _draw_area_apply_results(session):
         return
 
     loops = _build_closed_loops_from_boundary_ids(doc, ids)
+    _progress_update(progress_bar, 2, 4)
     if not loops:
         t = DB.Transaction(doc, 'Style Drawn Mix Area Boundaries')
         try:
@@ -409,7 +480,13 @@ def _draw_area_apply_results(session):
                 except Exception:
                     pass
 
+        loop_index = 0
+        loop_count = len(loops)
+        total_steps = 3 + loop_count + 1
+        _progress_update(progress_bar, 3, total_steps)
+
         for loop in loops:
+            loop_index += 1
             placed = False
             for x, y in _sample_points_for_loop(loop):
                 try:
@@ -423,8 +500,10 @@ def _draw_area_apply_results(session):
                     pass
             if not placed:
                 failed_loops += 1
+            _progress_update(progress_bar, 3 + loop_index, total_steps)
 
         t.Commit()
+        _progress_update(progress_bar, total_steps, total_steps)
     except Exception as ex:
         try:
             if t.HasStarted() and not t.HasEnded():
@@ -462,7 +541,22 @@ def _draw_area_idling(sender, args):
             return
 
     try:
-        _draw_area_apply_results(session)
+        progress_ctx = None
+        try:
+            progress_ctx = forms.ProgressBar(
+                title='Draw Area: processing boundary ({value} of {max_value})',
+                cancellable=False
+            )
+        except Exception:
+            progress_ctx = None
+
+        if progress_ctx is None:
+            # If the pyRevit progress UI is unavailable for any reason, still
+            # complete the Revit work and reopen the editor.
+            _draw_area_apply_results(session, None)
+        else:
+            with progress_ctx as progress_bar:
+                _draw_area_apply_results(session, progress_bar)
     finally:
         _draw_area_finish(session, reopen=True)
 
