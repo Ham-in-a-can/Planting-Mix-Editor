@@ -10,6 +10,17 @@ ids and Idling performs all model modifications once Revit returns to idle.
 from pyrevit import DB, forms
 from Autodesk.Revit.UI import RevitCommandId, PostableCommand
 
+try:
+    from System import EventHandler
+    from Autodesk.Revit.DB.Events import DocumentChangedEventArgs
+    from Autodesk.Revit.UI.Events import IdlingEventArgs
+    HAS_TYPED_REVIT_EVENTS = True
+except Exception:
+    EventHandler = None
+    DocumentChangedEventArgs = None
+    IdlingEventArgs = None
+    HAS_TYPED_REVIT_EVENTS = False
+
 _DRAW_AREA_SESSION = None
 DRAW_AREA_MAX_IDLE_WITHOUT_LINES = 25
 DRAW_AREA_MAX_IDLE_WITH_LINES = 1
@@ -411,6 +422,30 @@ def _progress_update(progress_bar, value, max_value):
         pass
 
 
+
+def _make_revit_event_handler(callback, args_type):
+    """Create a typed .NET event handler when Revit/IronPython requires one."""
+    if HAS_TYPED_REVIT_EVENTS and EventHandler is not None and args_type is not None:
+        try:
+            return EventHandler[args_type](callback)
+        except Exception:
+            pass
+    return callback
+
+
+def _exception_message(ex):
+    msg = _to_unicode(ex)
+    try:
+        inner = ex.InnerException
+    except Exception:
+        inner = None
+    if inner is not None:
+        inner_msg = _to_unicode(inner)
+        if inner_msg and inner_msg not in msg:
+            msg = msg + u'\n' + inner_msg
+    return msg
+
+
 class DrawAreaSession(object):
     """State kept alive while Revit's posted Area Boundary command runs."""
 
@@ -675,8 +710,14 @@ def start_draw_area_session(doc, uidoc, uiapp, view, mix_name, close_callback, r
 
     existing_ids = _collect_area_boundary_ids_in_view(doc, view.Id)
     session = DrawAreaSession(doc, uidoc, uiapp, view.Id, mix_name, existing_ids, reopen_callback, set_area_name_callback)
-    session.doc_changed_handler = _draw_area_document_changed
-    session.idling_handler = _draw_area_idling
+    session.doc_changed_handler = _make_revit_event_handler(
+        _draw_area_document_changed,
+        DocumentChangedEventArgs
+    )
+    session.idling_handler = _make_revit_event_handler(
+        _draw_area_idling,
+        IdlingEventArgs
+    )
     _DRAW_AREA_SESSION = session
 
     try:
@@ -684,7 +725,7 @@ def start_draw_area_session(doc, uidoc, uiapp, view, mix_name, close_callback, r
         uiapp.Idling += session.idling_handler
     except Exception as ex:
         _draw_area_finish(session, reopen=False)
-        forms.alert(u'Could not subscribe to Revit events for Draw Area:\n{0}'.format(ex),
+        forms.alert(u'Could not subscribe to Revit events for Draw Area:\n{0}'.format(_exception_message(ex)),
                     title='Draw Area')
         return False
 
@@ -701,7 +742,7 @@ def start_draw_area_session(doc, uidoc, uiapp, view, mix_name, close_callback, r
         uiapp.PostCommand(cmd_id)
     except Exception as ex:
         _draw_area_finish(session, reopen=False)
-        forms.alert(u'Could not start Revit Area Boundary drawing command:\n{0}'.format(ex),
+        forms.alert(u'Could not start Revit Area Boundary drawing command:\n{0}'.format(_exception_message(ex)),
                     title='Draw Area')
         _draw_area_reopen_editor(session)
         return False
