@@ -22,6 +22,10 @@ except Exception:
     HAS_TYPED_REVIT_EVENTS = False
 
 _DRAW_AREA_SESSION = None
+_DRAW_AREA_EVENTS_SUBSCRIBED = False
+_DRAW_AREA_DOC_CHANGED_HANDLER = None
+_DRAW_AREA_IDLING_HANDLER = None
+_DRAW_AREA_EVENTS_UIAPP = None
 DRAW_AREA_MAX_IDLE_WITHOUT_LINES = 25
 DRAW_AREA_MAX_IDLE_WITH_LINES = 1
 MIX_BOUNDARY_STYLE_NAME = u'BM Mix Boundary'
@@ -466,19 +470,56 @@ class DrawAreaSession(object):
         self.completed = False
 
 
-def _draw_area_unsubscribe(session):
-    if session is None:
+def _ensure_draw_area_events(uiapp):
+    """Subscribe persistent Revit handlers once for this module instance.
+
+    Re-subscribing after the modal editor has been reopened from a previous
+    Idling run can throw a generic Revit target-invocation exception. Keeping
+    one handler pair installed avoids the repeated add/remove cycle; the
+    handlers are inert whenever _DRAW_AREA_SESSION is None.
+    """
+    global _DRAW_AREA_EVENTS_SUBSCRIBED
+    global _DRAW_AREA_DOC_CHANGED_HANDLER
+    global _DRAW_AREA_IDLING_HANDLER
+    global _DRAW_AREA_EVENTS_UIAPP
+
+    if _DRAW_AREA_EVENTS_SUBSCRIBED and _DRAW_AREA_EVENTS_UIAPP is uiapp:
         return
+
+    doc_handler = _make_revit_event_handler(
+        _draw_area_document_changed,
+        DocumentChangedEventArgs
+    )
+    idling_handler = _make_revit_event_handler(
+        _draw_area_idling,
+        IdlingEventArgs
+    )
+
+    added_doc_handler = False
     try:
-        if session.doc_changed_handler is not None:
-            session.uiapp.Application.DocumentChanged -= session.doc_changed_handler
+        uiapp.Application.DocumentChanged += doc_handler
+        added_doc_handler = True
+        uiapp.Idling += idling_handler
     except Exception:
-        pass
-    try:
-        if session.idling_handler is not None:
-            session.uiapp.Idling -= session.idling_handler
-    except Exception:
-        pass
+        if added_doc_handler:
+            try:
+                uiapp.Application.DocumentChanged -= doc_handler
+            except Exception:
+                pass
+        raise
+
+    _DRAW_AREA_DOC_CHANGED_HANDLER = doc_handler
+    _DRAW_AREA_IDLING_HANDLER = idling_handler
+    _DRAW_AREA_EVENTS_UIAPP = uiapp
+    _DRAW_AREA_EVENTS_SUBSCRIBED = True
+
+
+def _draw_area_unsubscribe(session):
+    # Handlers are intentionally kept subscribed for the module lifetime. They
+    # immediately return when _DRAW_AREA_SESSION is None, and avoiding repeated
+    # event add/remove cycles prevents the second Draw Area run subscription
+    # failure seen after returning to the modal Mix Editor.
+    return
 
 
 def _draw_area_reopen_editor(session):
@@ -710,24 +751,15 @@ def start_draw_area_session(doc, uidoc, uiapp, view, mix_name, close_callback, r
 
     existing_ids = _collect_area_boundary_ids_in_view(doc, view.Id)
     session = DrawAreaSession(doc, uidoc, uiapp, view.Id, mix_name, existing_ids, reopen_callback, set_area_name_callback)
-    session.doc_changed_handler = _make_revit_event_handler(
-        _draw_area_document_changed,
-        DocumentChangedEventArgs
-    )
-    session.idling_handler = _make_revit_event_handler(
-        _draw_area_idling,
-        IdlingEventArgs
-    )
-    _DRAW_AREA_SESSION = session
 
     try:
-        uiapp.Application.DocumentChanged += session.doc_changed_handler
-        uiapp.Idling += session.idling_handler
+        _ensure_draw_area_events(uiapp)
     except Exception as ex:
-        _draw_area_finish(session, reopen=False)
         forms.alert(u'Could not subscribe to Revit events for Draw Area:\n{0}'.format(_exception_message(ex)),
                     title='Draw Area')
         return False
+
+    _DRAW_AREA_SESSION = session
 
     try:
         if close_callback is not None:
