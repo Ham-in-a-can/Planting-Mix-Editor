@@ -7,19 +7,16 @@ API context returns, so DocumentChanged only records newly added boundary line
 ids and Idling performs all model modifications once Revit returns to idle.
 """
 
-import System
-
 from pyrevit import DB, forms
 from Autodesk.Revit.UI import RevitCommandId, PostableCommand
 
 try:
-    from System import EventHandler, Action
+    from System import EventHandler
     from Autodesk.Revit.DB.Events import DocumentChangedEventArgs
     from Autodesk.Revit.UI.Events import IdlingEventArgs
     HAS_TYPED_REVIT_EVENTS = True
 except Exception:
     EventHandler = None
-    Action = None
     DocumentChangedEventArgs = None
     IdlingEventArgs = None
     HAS_TYPED_REVIT_EVENTS = False
@@ -485,43 +482,12 @@ def _draw_area_unsubscribe(session):
 
 
 def _draw_area_reopen_editor(session):
-    if session is None or session.reopen_callback is None:
-        return
-
-    # Do not call ShowDialog synchronously from inside Revit's Idling event.
-    # Keeping the Idling call stack open while the Mix Editor is displayed can
-    # leave Revit's event system in a state where the next Draw Area run cannot
-    # subscribe to Idling/DocumentChanged. Dispatch the reopen so this handler
-    # returns to Revit first, then show the editor on the UI thread.
-    reopen_doc = session.doc
-    reopen_callback = session.reopen_callback
-
-    def _do_reopen():
-        try:
-            reopen_callback(reopen_doc)
-        except Exception as ex:
-            forms.alert(u'Could not reopen the Mix Schedule Editor:\n{0}'.format(_exception_message(ex)),
-                        title='Draw Area')
-
     try:
-        app = System.Windows.Application.Current
-        dispatcher = app.Dispatcher if app is not None else None
-    except Exception:
-        dispatcher = None
-    if dispatcher is None:
-        try:
-            dispatcher = System.Windows.Threading.Dispatcher.CurrentDispatcher
-        except Exception:
-            dispatcher = None
-
-    if dispatcher is not None and Action is not None:
-        try:
-            dispatcher.BeginInvoke(Action(_do_reopen))
-            return
-        except Exception:
-            pass
-
-    _do_reopen()
+        if session is not None and session.reopen_callback is not None:
+            session.reopen_callback(session.doc)
+    except Exception as ex:
+        forms.alert(u'Could not reopen the Mix Schedule Editor:\n{0}'.format(_exception_message(ex)),
+                    title='Draw Area')
 
 
 def _draw_area_finish(session, reopen=True):
