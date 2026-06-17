@@ -759,13 +759,17 @@ def start_draw_area_session(doc, uidoc, uiapp, view, mix_name, close_callback, r
                     title='Draw Area')
         return False
 
-    _DRAW_AREA_SESSION = session
-
     try:
         if close_callback is not None:
             close_callback()
     except Exception:
         pass
+
+    # Only mark the session active after the editor has been asked to close.
+    # The persistent Idling handler may run while the modal editor is still
+    # unwinding; keeping the session inactive until now prevents it from
+    # processing before the native Area Boundary command is posted.
+    _DRAW_AREA_SESSION = session
 
     try:
         cmd_id = RevitCommandId.LookupPostableCommandId(PostableCommand.AreaBoundary)
