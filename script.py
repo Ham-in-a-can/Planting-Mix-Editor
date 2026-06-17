@@ -2522,8 +2522,8 @@ class MixWindowController(object):
             if SCRIPT_DIR not in sys.path:
                 sys.path.append(SCRIPT_DIR)
             import DrawArea as draw_area
-            # Do not reload DrawArea here: it owns module-level event session
-            # state that must survive until Idling unsubscribes the handlers.
+            # Do not reload DrawArea here: it owns module-level session
+            # and persistent Revit event handler state across Draw Area runs.
             draw_area.start_draw_area_session(
                 doc,
                 uidoc,

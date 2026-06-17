@@ -483,7 +483,11 @@ def _ensure_draw_area_events(uiapp):
     global _DRAW_AREA_IDLING_HANDLER
     global _DRAW_AREA_EVENTS_UIAPP
 
-    if _DRAW_AREA_EVENTS_SUBSCRIBED and _DRAW_AREA_EVENTS_UIAPP is uiapp:
+    # Revit/IronPython can provide a different Python wrapper for the same
+    # underlying UIApplication on later calls. Do not use `is uiapp` to decide
+    # whether handlers are already subscribed. The handlers are module-level
+    # singletons and remain inert whenever _DRAW_AREA_SESSION is None.
+    if _DRAW_AREA_EVENTS_SUBSCRIBED:
         return
 
     doc_handler = _make_revit_event_handler(
