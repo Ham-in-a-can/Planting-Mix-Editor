@@ -127,6 +127,7 @@ FILLED_REGION_HEIGHT_MM = 4.0
 # Debug: set True while trying to understand filled region behaviour
 DEBUG_FILLED_REGION = False
 
+
 #Path to plant library script
 CREATE_PLANT_SCRIPT_PATH = r"C:\Users\hamishc\OneDrive - Boffa Miskell\Desktop\Shared_Dynamo\ToolBar\OnServer\BoffaTestTools.extension\BoffaTools.tab\Test.panel\Create Plant.pushbutton\script.py"
 
@@ -378,6 +379,9 @@ def set_param(element, name, value):
     except Exception:
         # swallow errors rather than killing the UI
         pass
+
+
+
 
 
 def copy_param_between_elements(src_elem, dst_elem, param_name):
@@ -876,10 +880,18 @@ def _ensure_filled_region_for_mix(doc, mix_name, color, host_view):
 
 # ---- Percent conversions ----
 def pct_raw_to_display(raw):
-    """Convert stored decimal or percent-ish value to '50%' style string."""
+    """Convert stored decimal or percent value to a display string like '50%'.
+
+    Revit percentage parameters are stored internally as decimal fractions
+    (0.5 = 50%), but AsValueString often returns text that already includes
+    a percent sign (for example '1%'). Values that already look like percent
+    text must be displayed exactly as percent values; otherwise '1%' would be
+    interpreted as an internal decimal and incorrectly shown as '100%'.
+    """
     s = _to_unicode(raw).strip()
     if not s:
         return u''
+    has_percent_sign = u'%' in s
     s = s.replace(u'%', u'').replace(u',', u'.')
     cleaned = []
     for ch in s:
@@ -892,7 +904,9 @@ def pct_raw_to_display(raw):
         val = float(s_num)
     except Exception:
         return u''
-    if val <= 1.0 + 1e-9:
+    if has_percent_sign:
+        perc = val
+    elif abs(val) < 1.0 - 1e-9:
         perc = val * 100.0
     else:
         perc = val
@@ -905,7 +919,11 @@ def pct_raw_to_display(raw):
 
 
 def pct_display_to_raw(display):
-    """Convert user display like '50%' or '50' or '0.5' into decimal string '0.5'."""
+    """Convert user-entered percent text into Revit's decimal percentage.
+
+    Species percentages are entered as displayed percent values. Therefore
+    '1', '1%', and '0.5' mean 1%, 1%, and 0.5% respectively, not 100% or 50%.
+    """
     s = _to_unicode(display).strip()
     if not s:
         return u''
@@ -921,11 +939,8 @@ def pct_display_to_raw(display):
         val = float(s_num)
     except Exception:
         return u''
-    if val > 1.0 + 1e-9:
-        raw = val / 100.0
-    else:
-        raw = val
-    raw_str = (u'%.4f' % raw).rstrip('0').rstrip('.')
+    raw = val / 100.0
+    raw_str = (u'%.6f' % raw).rstrip('0').rstrip('.')
     if not raw_str:
         raw_str = u'0'
     return raw_str
@@ -980,6 +995,8 @@ def space_display_to_raw(display):
     return _to_unicode(mm_int)
 
 
+
+
 # -----------------------------
 # Data models
 # -----------------------------
@@ -1020,6 +1037,8 @@ class SpeciesRow(object):
         self.com = com or u''
         self.grade = grade or u''
         self.is_groundcover = is_groundcover
+        self.approx_block = None
+        self.approx_col_def = None
 
 
 class MixModel(object):
@@ -1032,6 +1051,8 @@ class MixModel(object):
         self.title_block = None
         self.header_grid = None
         self.summary_block = None
+        self.area_total_block = None
+        self.approx_col_defs = []
 
         self.mix_name = get_param(element, PARAM_MIX_NAME) or u'(unnamed mix)'
 
@@ -1207,6 +1228,9 @@ class MixWindowController(object):
         self.stack_panel = None
         self.apply_button = None
         self.close_button = None
+        self.approx_button = None
+        self.show_approx_numbers = False
+        self._area_totals_by_mix_key = {}
         self.current_expanded = None
         self._mix_symbol = None
         self._target_view_id = None
@@ -1228,6 +1252,7 @@ class MixWindowController(object):
         self._color_entries_by_key = {}         # u"Mix Name" -> ColorFillSchemeEntry
 
         self._load_mixes()
+        self._area_totals_by_mix_key = self._load_area_totals_by_mix_name()
         self._load_color_scheme()
         for mix in self.mixes:
             self._attach_color_to_mix(mix)
@@ -1480,6 +1505,194 @@ class MixWindowController(object):
         except Exception:
             return None
 
+    def _mix_area_key(self, name):
+        return _to_unicode(name).strip().lower()
+
+    def _area_value_to_m2(self, area_value_ft2):
+        try:
+            return DB.UnitUtils.ConvertFromInternalUnits(
+                area_value_ft2,
+                DB.UnitTypeId.SquareMeters
+            )
+        except Exception:
+            pass
+        try:
+            return DB.UnitUtils.ConvertFromInternalUnits(
+                area_value_ft2,
+                DB.DisplayUnitType.DUT_SQUARE_METERS
+            )
+        except Exception:
+            pass
+        try:
+            return float(area_value_ft2) * 0.09290304
+        except Exception:
+            return 0.0
+
+    def _get_area_element_name(self, area):
+        name = get_param(area, AREA_NAME_PARAM)
+        if name:
+            return _to_unicode(name).strip()
+        try:
+            p = area.get_Parameter(DB.BuiltInParameter.ROOM_NAME)
+            if p:
+                name = p.AsString()
+                if name:
+                    return _to_unicode(name).strip()
+        except Exception:
+            pass
+        try:
+            return _to_unicode(area.Name).strip()
+        except Exception:
+            return u''
+
+    def _get_area_element_m2(self, area):
+        p = None
+        try:
+            p = area.get_Parameter(DB.BuiltInParameter.ROOM_AREA)
+        except Exception:
+            p = None
+        if p is None:
+            try:
+                p = area.LookupParameter('Area')
+            except Exception:
+                p = None
+        if p is None:
+            return 0.0
+        try:
+            return self._area_value_to_m2(p.AsDouble())
+        except Exception:
+            return 0.0
+
+    def _load_area_totals_by_mix_name(self):
+        totals = {}
+        try:
+            areas = (DB.FilteredElementCollector(self.doc)
+                     .OfCategory(DB.BuiltInCategory.OST_Areas)
+                     .WhereElementIsNotElementType())
+        except Exception:
+            areas = []
+        for area in areas:
+            name = self._get_area_element_name(area)
+            key = self._mix_area_key(name)
+            if not key:
+                continue
+            area_m2 = self._get_area_element_m2(area)
+            if area_m2 <= 0.0:
+                continue
+            totals[key] = totals.get(key, 0.0) + area_m2
+        return totals
+
+    def _get_mix_area_m2(self, mix):
+        if mix is None:
+            return 0.0
+        return self._area_totals_by_mix_key.get(self._mix_area_key(mix.mix_name), 0.0)
+
+    def _format_area_m2(self, value):
+        try:
+            value = float(value)
+        except Exception:
+            return u''
+        if value <= 0.0001:
+            return u''
+        rounded = int(round(value))
+        if abs(value - rounded) < 0.05:
+            return u'{0}m²'.format(rounded)
+        return (u'%.1fm²' % value)
+
+    def _parse_percent_fraction_for_approx(self, text):
+        raw = pct_display_to_raw(text)
+        if raw in (None, u'', ''):
+            return None
+        try:
+            val = float(raw)
+        except Exception:
+            return None
+        if val <= 0.0:
+            return None
+        return val
+
+    def _parse_spacing_m_for_approx(self, text):
+        raw_mm = space_display_to_raw(text)
+        if raw_mm in (None, u'', ''):
+            return None
+        try:
+            spacing_m = float(raw_mm) / 1000.0
+        except Exception:
+            return None
+        if spacing_m <= 0.0:
+            return None
+        return spacing_m
+
+    def _set_approx_col_width(self, col_def):
+        if col_def is None:
+            return
+        try:
+            col_def.Width = GridLength(38 if self.show_approx_numbers else 0)
+        except Exception:
+            pass
+
+    def _update_approx_toggle_button_visual(self):
+        btn = getattr(self, 'approx_button', None)
+        if btn is None:
+            return
+        try:
+            if self.show_approx_numbers:
+                btn.Background = Media.Brushes.LightGray
+                btn.FontWeight = FontWeights.SemiBold
+            else:
+                btn.Background = Media.Brushes.WhiteSmoke
+                btn.FontWeight = FontWeights.Normal
+        except Exception:
+            pass
+
+    def _update_approx_numbers_for_mix(self, mix):
+        if mix is None:
+            return
+
+        for col_def in getattr(mix, 'approx_col_defs', []):
+            self._set_approx_col_width(col_def)
+
+        area_m2 = self._get_mix_area_m2(mix)
+        area_text = self._format_area_m2(area_m2)
+        block = getattr(mix, 'area_total_block', None)
+        if block is not None:
+            try:
+                if self.show_approx_numbers and area_text:
+                    block.Text = u' - ' + area_text
+                    block.Visibility = Visibility.Visible
+                else:
+                    block.Text = u''
+                    block.Visibility = Visibility.Collapsed
+            except Exception:
+                pass
+
+        for row in getattr(mix, 'rows', []):
+            approx_block = getattr(row, 'approx_block', None)
+            if approx_block is None:
+                continue
+            text = u''
+            if self.show_approx_numbers and area_m2 > 0.0001:
+                pct_fraction = self._parse_percent_fraction_for_approx(row.pct)
+                spacing_m = self._parse_spacing_m_for_approx(row.spacing)
+                if pct_fraction is not None and spacing_m is not None:
+                    area_per_plant = spacing_m * spacing_m * 0.8660254037844386
+                    if area_per_plant > 0.0:
+                        try:
+                            count = int(round((area_m2 * pct_fraction) / area_per_plant))
+                            if count > 0:
+                                text = _to_unicode(count)
+                        except Exception:
+                            text = u''
+            try:
+                approx_block.Text = text
+                approx_block.Visibility = Visibility.Visible if (self.show_approx_numbers and text) else Visibility.Collapsed
+            except Exception:
+                pass
+
+    def _update_all_approx_numbers(self):
+        for mix in self.mixes:
+            self._update_approx_numbers_for_mix(mix)
+
     def _record_mix_rename(self, old_name, new_name):
         """Record that a mix name changed; will be applied to Areas on Apply."""
         old_name = _to_unicode(old_name).strip()
@@ -1526,7 +1739,11 @@ class MixWindowController(object):
         self.stack_panel = self.window.FindName('MixStackPanel')
         self.apply_button = self.window.FindName('ApplyButton')
         self.close_button = self.window.FindName('CloseButton')
+        self.approx_button = self.window.FindName('ApproxNumbersToggle')
 
+        if self.approx_button is not None:
+            self.approx_button.Click += self.on_approx_numbers_toggle
+            self._update_approx_toggle_button_visual()
         if self.apply_button is not None:
             self.apply_button.Click += self.on_apply
         if self.close_button is not None:
@@ -1614,12 +1831,25 @@ class MixWindowController(object):
         Grid.SetColumn(header_stack, 1)
         header_grid.Children.Add(header_stack)
 
+        title_line = StackPanel()
+        title_line.Orientation = Orientation.Horizontal
+        header_stack.Children.Add(title_line)
+
         title = TextBlock()
         title.Text = mix.mix_name
         title.FontSize = 14
         title.VerticalAlignment = VerticalAlignment.Center
         title.Foreground = Media.Brushes.Black
-        header_stack.Children.Add(title)
+        title_line.Children.Add(title)
+
+        area_total = TextBlock()
+        area_total.Text = u''
+        area_total.FontSize = 11
+        area_total.Margin = Thickness(4, 2, 0, 0)
+        area_total.VerticalAlignment = VerticalAlignment.Center
+        area_total.Foreground = Media.Brushes.Gray
+        area_total.Visibility = Visibility.Collapsed
+        title_line.Children.Add(area_total)
 
         summary = TextBlock()
         summary.Text = u''
@@ -1668,6 +1898,7 @@ class MixWindowController(object):
         mix.arrow = arrow
         mix.header_grid = header_grid
         mix.title_block = title
+        mix.area_total_block = area_total
         mix.summary_block = summary
 
         header_grid.Tag = mix
@@ -1677,6 +1908,7 @@ class MixWindowController(object):
         outer_stack.Children.Add(body)
 
         self._render_mix_body(mix)
+        self._update_approx_numbers_for_mix(mix)
 
         if mix.is_expanded:
             body.Visibility = Visibility.Visible
@@ -1795,6 +2027,7 @@ class MixWindowController(object):
         if body is None:
             return
         body.Children.Clear()
+        mix.approx_col_defs = []
 
         # --- Area colour row ---
         color_grid = Grid()
@@ -1804,7 +2037,7 @@ class MixWindowController(object):
         color_grid.ColumnDefinitions.Add(ColumnDefinition())
         color_grid.ColumnDefinitions[0].Width = GridLength(1, GridUnitType.Auto)
         color_grid.ColumnDefinitions[1].Width = GridLength(80)
-        color_grid.ColumnDefinitions[2].Width = GridLength(80)
+        color_grid.ColumnDefinitions[2].Width = GridLength(170)
 
 
         color_label = TextBlock()
@@ -1856,7 +2089,12 @@ class MixWindowController(object):
         Grid.SetColumn(swatch, 1)
         color_grid.Children.Add(swatch)
 
-        # --- Place Area button next to colour swatch ---
+        # --- Place Area / Draw Area buttons next to colour swatch ---
+        area_button_panel = StackPanel()
+        area_button_panel.Orientation = Orientation.Horizontal
+        area_button_panel.HorizontalAlignment = HorizontalAlignment.Left
+        Grid.SetColumn(area_button_panel, 2)
+
         place_btn = Button()
         place_btn.Content = u'Place Area'
         place_btn.FontSize = 10
@@ -1865,8 +2103,19 @@ class MixWindowController(object):
         place_btn.HorizontalAlignment = HorizontalAlignment.Left
         place_btn.Tag = mix
         place_btn.Click += self.on_place_area_click
-        Grid.SetColumn(place_btn, 2)
-        color_grid.Children.Add(place_btn)
+        area_button_panel.Children.Add(place_btn)
+
+        draw_btn = Button()
+        draw_btn.Content = u'Draw Area'
+        draw_btn.FontSize = 10
+        draw_btn.Margin = Thickness(6, 0, 0, 0)
+        draw_btn.Padding = Thickness(4, 0, 4, 0)
+        draw_btn.HorizontalAlignment = HorizontalAlignment.Left
+        draw_btn.Tag = mix
+        draw_btn.Click += self.on_draw_area_click
+        area_button_panel.Children.Add(draw_btn)
+
+        color_grid.Children.Add(area_button_panel)
 
         mix.area_color_border = swatch
         body.Children.Add(color_grid)
@@ -1874,19 +2123,21 @@ class MixWindowController(object):
 
         # --- Header row for species table ---
         header_grid = Grid()
-        for _ in range(8):  # Code, Percent, Spacing, Bot, Com, Grade, toggle, minus
+        for _ in range(9):  # Approx, Code, Percent, Spacing, Bot, Com, Grade, toggle, minus
             header_grid.ColumnDefinitions.Add(ColumnDefinition())
 
-        header_grid.ColumnDefinitions[0].Width = GridLength(60)   # Code
-        header_grid.ColumnDefinitions[1].Width = GridLength(45)   # Percent
-        header_grid.ColumnDefinitions[2].Width = GridLength(45)   # Spacing
-        header_grid.ColumnDefinitions[3].Width = GridLength(1, GridUnitType.Star)  # Bot
-        header_grid.ColumnDefinitions[4].Width = GridLength(1, GridUnitType.Star)  # Com
-        header_grid.ColumnDefinitions[5].Width = GridLength(45)   # Grade
-        header_grid.ColumnDefinitions[6].Width = GridLength(30)   # Toggle
-        header_grid.ColumnDefinitions[7].Width = GridLength(26)   # Minus
+        header_grid.ColumnDefinitions[0].Width = GridLength(38 if self.show_approx_numbers else 0)
+        header_grid.ColumnDefinitions[1].Width = GridLength(60)   # Code
+        header_grid.ColumnDefinitions[2].Width = GridLength(45)   # Percent
+        header_grid.ColumnDefinitions[3].Width = GridLength(45)   # Spacing
+        header_grid.ColumnDefinitions[4].Width = GridLength(1, GridUnitType.Star)  # Bot
+        header_grid.ColumnDefinitions[5].Width = GridLength(1, GridUnitType.Star)  # Com
+        header_grid.ColumnDefinitions[6].Width = GridLength(45)   # Grade
+        header_grid.ColumnDefinitions[7].Width = GridLength(30)   # Toggle
+        header_grid.ColumnDefinitions[8].Width = GridLength(26)   # Minus
+        mix.approx_col_defs.append(header_grid.ColumnDefinitions[0])
 
-        labels = [u'Code', u'Percent', u'Spacing',
+        labels = [u'', u'Code', u'Percent', u'Spacing',
                   u'Botanical Name', u'Common Name', u'Grade', u'', u'']
         for idx, text in enumerate(labels):
             tb = TextBlock()
@@ -1902,24 +2153,39 @@ class MixWindowController(object):
         # --- Data rows ---
         for row_index, row in enumerate(mix.rows):
             row_grid = Grid()
-            for _ in range(8):
+            for _ in range(9):
                 row_grid.ColumnDefinitions.Add(ColumnDefinition())
 
-            row_grid.ColumnDefinitions[0].Width = GridLength(60)
-            row_grid.ColumnDefinitions[1].Width = GridLength(45)
+            row_grid.ColumnDefinitions[0].Width = GridLength(38 if self.show_approx_numbers else 0)
+            row_grid.ColumnDefinitions[1].Width = GridLength(60)
             row_grid.ColumnDefinitions[2].Width = GridLength(45)
-            row_grid.ColumnDefinitions[3].Width = GridLength(1, GridUnitType.Star)
+            row_grid.ColumnDefinitions[3].Width = GridLength(45)
             row_grid.ColumnDefinitions[4].Width = GridLength(1, GridUnitType.Star)
-            row_grid.ColumnDefinitions[5].Width = GridLength(45)
-            row_grid.ColumnDefinitions[6].Width = GridLength(30)
-            row_grid.ColumnDefinitions[7].Width = GridLength(26)
+            row_grid.ColumnDefinitions[5].Width = GridLength(1, GridUnitType.Star)
+            row_grid.ColumnDefinitions[6].Width = GridLength(45)
+            row_grid.ColumnDefinitions[7].Width = GridLength(30)
+            row_grid.ColumnDefinitions[8].Width = GridLength(26)
+            row.approx_col_def = row_grid.ColumnDefinitions[0]
+            mix.approx_col_defs.append(row.approx_col_def)
+
+            approx_tb = TextBlock()
+            approx_tb.Text = u''
+            approx_tb.FontSize = 10
+            approx_tb.Margin = Thickness(0, 2, 4, 2)
+            approx_tb.Foreground = Media.Brushes.Gray
+            approx_tb.HorizontalAlignment = HorizontalAlignment.Right
+            approx_tb.VerticalAlignment = VerticalAlignment.Center
+            approx_tb.Visibility = Visibility.Collapsed
+            row.approx_block = approx_tb
+            Grid.SetColumn(approx_tb, 0)
+            row_grid.Children.Add(approx_tb)
 
             code_box = TextBox()
             code_box.Text = row.code
             code_box.Margin = Thickness(0, 0, 4, 2)
             code_box.Tag = (mix, row_index, 'code')
             code_box.TextChanged += self.on_cell_changed
-            Grid.SetColumn(code_box, 0)
+            Grid.SetColumn(code_box, 1)
             row_grid.Children.Add(code_box)
 
             pct_box = TextBox()
@@ -1930,7 +2196,7 @@ class MixWindowController(object):
             pct_box.LostFocus += self.on_pct_lost_focus
             pct_box.GotKeyboardFocus += self.on_textbox_got_keyboard_focus
             pct_box.PreviewMouseLeftButtonDown += self.on_textbox_preview_mouse_left_button_down
-            Grid.SetColumn(pct_box, 1)
+            Grid.SetColumn(pct_box, 2)
             row_grid.Children.Add(pct_box)
 
             space_box = TextBox()
@@ -1941,7 +2207,7 @@ class MixWindowController(object):
             space_box.LostFocus += self.on_space_lost_focus
             space_box.GotKeyboardFocus += self.on_textbox_got_keyboard_focus
             space_box.PreviewMouseLeftButtonDown += self.on_textbox_preview_mouse_left_button_down
-            Grid.SetColumn(space_box, 2)
+            Grid.SetColumn(space_box, 3)
             row_grid.Children.Add(space_box)
 
             # Botanical name cell: outer border for grid line, inner grid for text + fade
@@ -2025,7 +2291,7 @@ class MixWindowController(object):
                 except Exception:
                     pass
 
-            Grid.SetColumn(bot_border, 3)
+            Grid.SetColumn(bot_border, 4)
             row_grid.Children.Add(bot_border)
 
             # Common name cell: same pattern as Botanical
@@ -2103,7 +2369,7 @@ class MixWindowController(object):
                 except Exception:
                     pass
 
-            Grid.SetColumn(com_border, 4)
+            Grid.SetColumn(com_border, 5)
             row_grid.Children.Add(com_border)
 
             grade_box = TextBox()
@@ -2111,7 +2377,7 @@ class MixWindowController(object):
             grade_box.Margin = Thickness(0, 0, 4, 2)
             grade_box.Tag = (mix, row_index, 'grade')
             grade_box.TextChanged += self.on_cell_changed
-            Grid.SetColumn(grade_box, 5)
+            Grid.SetColumn(grade_box, 6)
             row_grid.Children.Add(grade_box)
 
             toggle_btn = Button()
@@ -2137,7 +2403,7 @@ class MixWindowController(object):
                 toggle_btn.Content = toggle_img
             else:
                 toggle_btn.Content = u'G' if getattr(row, 'is_groundcover', True) else u'T'
-            Grid.SetColumn(toggle_btn, 6)
+            Grid.SetColumn(toggle_btn, 7)
             row_grid.Children.Add(toggle_btn)
 
             minus_btn = Button()
@@ -2150,7 +2416,7 @@ class MixWindowController(object):
             minus_btn.BorderBrush = Media.Brushes.Transparent
             minus_btn.Tag = (mix, row_index)
             minus_btn.Click += self.on_remove_row
-            Grid.SetColumn(minus_btn, 7)
+            Grid.SetColumn(minus_btn, 8)
             row_grid.Children.Add(minus_btn)
 
             body.Children.Add(row_grid)
@@ -2242,6 +2508,7 @@ class MixWindowController(object):
 
 
         self._update_mix_percent_summary(mix)
+        self._update_approx_numbers_for_mix(mix)
 
     def _begin_rename_mix(self, mix):
         """Inline rename of a mix header in the same position as the title text."""
@@ -2350,6 +2617,13 @@ class MixWindowController(object):
         except Exception:
             pass
 
+    def on_approx_numbers_toggle(self, sender, args):
+        self.show_approx_numbers = not self.show_approx_numbers
+        if self.show_approx_numbers:
+            self._area_totals_by_mix_key = self._load_area_totals_by_mix_name()
+        self._update_approx_toggle_button_visual()
+        self._update_all_approx_numbers()
+
     # ---- Event handlers ----
     def on_header_mouse_left_button_up(self, sender, args):
         """Single-click expands/collapses; quick double-click enters inline rename mode."""
@@ -2449,6 +2723,61 @@ class MixWindowController(object):
             sender.Opacity = 1.0
         except Exception:
             pass
+
+
+    def on_draw_area_click(self, sender, args):
+        """Start the DrawArea.py native Area Boundary workflow for a mix."""
+        mix = getattr(sender, 'Tag', None)
+        if mix is None:
+            return
+
+        mix_name = getattr(mix, 'mix_name', None)
+        if mix_name is not None:
+            mix_name = _to_unicode(mix_name).strip()
+
+        doc = self.doc
+        uidoc = revit.uidoc
+        try:
+            uiapp = uidoc.Application
+        except Exception:
+            uiapp = None
+        view = doc.ActiveView
+
+        # Bind callback dependencies as default arguments. pyRevit can tear
+        # down this command module's globals before DrawArea.py receives the
+        # later Idling callback, so reopening must load a fresh copy of this
+        # script module instead of reusing the old MixWindowController class
+        # whose methods depend on globals such as DB, forms, and XamlReader.
+        def _close_editor(window=self.window):
+            try:
+                if window is not None:
+                    window.Close()
+            except Exception:
+                pass
+
+        def _reopen_editor(reopen_doc, script_path=os.path.join(SCRIPT_DIR, 'script.py'), loader=imp.load_source):
+            reopened = loader('mix_schedule_editor_reopen', script_path)
+            reopened.open_mix_editor(reopen_doc)
+
+        try:
+            if SCRIPT_DIR not in sys.path:
+                sys.path.append(SCRIPT_DIR)
+            import DrawArea as draw_area
+            # Do not reload DrawArea here: it owns module-level session
+            # and persistent Revit event handler state across Draw Area runs.
+            draw_area.start_draw_area_session(
+                doc,
+                uidoc,
+                uiapp,
+                view,
+                mix_name,
+                _close_editor,
+                _reopen_editor,
+                lambda area, name, setter=set_param, pname=AREA_NAME_PARAM: setter(area, pname, name)
+            )
+        except Exception as ex:
+            forms.alert(u'Draw Area raised an error:\n{0}'.format(ex),
+                        title='Draw Area')
 
     def on_place_area_click(self, sender, args):
         """Run Boundary.py when 'Place Area' is clicked for a mix."""
@@ -2555,8 +2884,10 @@ class MixWindowController(object):
             elif field == 'pct':
                 row.pct = text
                 self._update_mix_percent_summary(mix)
+                self._update_approx_numbers_for_mix(mix)
             elif field == 'spacing':
                 row.spacing = text
+                self._update_approx_numbers_for_mix(mix)
             elif field == 'bot':
                 row.bot = text
             elif field == 'com':
@@ -2592,6 +2923,7 @@ class MixWindowController(object):
             if 0 <= row_index < len(mix.rows):
                 mix.rows[row_index].pct = u''
                 self._update_mix_percent_summary(mix)
+                self._update_approx_numbers_for_mix(mix)
             return
         display = pct_raw_to_display(raw)
         if 0 <= row_index < len(mix.rows):
@@ -2599,6 +2931,7 @@ class MixWindowController(object):
         if display != text:
             sender.Text = display
         self._update_mix_percent_summary(mix)
+        self._update_approx_numbers_for_mix(mix)
 
     def on_space_lost_focus(self, sender, args):
         tag = sender.Tag
@@ -2612,12 +2945,14 @@ class MixWindowController(object):
         if not raw:
             if 0 <= row_index < len(mix.rows):
                 mix.rows[row_index].spacing = u''
+                self._update_approx_numbers_for_mix(mix)
             return
         display = space_raw_to_display(raw)
         if 0 <= row_index < len(mix.rows):
             mix.rows[row_index].spacing = display
         if display != text:
             sender.Text = display
+        self._update_approx_numbers_for_mix(mix)
 
     def on_remove_row(self, sender, args):
         tag = sender.Tag
@@ -2811,6 +3146,7 @@ class MixWindowController(object):
         # 4. Rebuild the UI and refresh the header percent summary
         self._render_mix_body(mix)
         self._update_mix_percent_summary(mix)
+        self._update_approx_numbers_for_mix(mix)
 
 
     def on_create_new_mix(self, sender, args):
@@ -3168,6 +3504,8 @@ class MixWindowController(object):
             self._update_filled_region_strips()
 
             t.Commit()
+            self._area_totals_by_mix_key = self._load_area_totals_by_mix_name()
+            self._update_all_approx_numbers()
             # After committing, show a debug popup with everything we logged
             show_fr_debug_popup()
 
@@ -3208,9 +3546,14 @@ class MixWindowController(object):
             self.window.ShowDialog()
 
 
+def open_mix_editor(doc):
+    controller = MixWindowController(doc)
+    if controller.window is not None:
+        controller.show()
+
+
 # -----------------------------
 # Run
 # -----------------------------
-controller = MixWindowController(revit.doc)
-if controller.window is not None:
-    controller.show()
+if __name__ == '__main__':
+    open_mix_editor(revit.doc)
