@@ -107,18 +107,24 @@ COLOR_SCHEME_CATEGORY = DB.BuiltInCategory.OST_Areas   # Category for scheme
 DEFAULT_AREA_COLORS = [
     (u'Soft Green',   DB.Color(198, 224, 180)),
     (u'Mid Green',    DB.Color(169, 209, 142)),
+    (u'Yellow Green', DB.Color(217, 234, 168)),
     (u'Olive',        DB.Color(143, 188, 143)),
+    (u'Mint',         DB.Color(201, 230, 214)),
+    (u'Blue Green',   DB.Color(182, 215, 210)),
+    (u'Aqua',         DB.Color(208, 236, 231)),
     (u'Blue',         DB.Color(189, 215, 238)),
-    (u'Yellow',       DB.Color(255, 242, 204)),
-    (u'Orange',       DB.Color(252, 213, 180)),
+    (u'Lavender',     DB.Color(217, 210, 233)),
+    (u'Mauve',        DB.Color(208, 197, 226)),
     (u'Red',          DB.Color(244, 199, 195)),
-    (u'Grey',         DB.Color(217, 217, 217)),
-    (u'Dark Green',   DB.Color(0,   97,  0)),
-    (u'Deep Blue',    DB.Color(0,   112, 192)),
-    (u'Purple',       DB.Color(112, 48,  160)),
-    (u'Brown',        DB.Color(150, 75,  0)),
-    (u'Light Grey',   DB.Color(242, 242, 242)),
+    (u'Orange',       DB.Color(252, 213, 180)),
+    (u'Clay',         DB.Color(224, 184, 164)),
+    (u'Sand',         DB.Color(234, 220, 196)),
+    (u'Yellow',       DB.Color(255, 242, 204)),
 ]
+
+QUICK_COLOR_SWATCH_SIZE = 22
+QUICK_COLOR_SWATCH_MARGIN = 2
+QUICK_COLOR_COLUMNS = 5
 
 # Filled Region strip configuration (schedule colour bars)
 FILLED_REGION_WIDTH_MM = 20.0
@@ -619,13 +625,16 @@ def pick_area_color_with_palette(initial_dbcolor, owner_window=None):
 
     wrap = WrapPanel()
     wrap.Margin = Thickness(0, 0, 0, 8)
+    # Keep the quick colour palette at a predictable width so added defaults
+    # wrap into visible rows instead of stretching the popup horizontally.
+    wrap.Width = QUICK_COLOR_COLUMNS * (QUICK_COLOR_SWATCH_SIZE + (QUICK_COLOR_SWATCH_MARGIN * 2))
     root.Children.Add(wrap)
 
     for name, dbcol in DEFAULT_AREA_COLORS:
         sw = Border()
-        sw.Width = 22
-        sw.Height = 22
-        sw.Margin = Thickness(2)
+        sw.Width = QUICK_COLOR_SWATCH_SIZE
+        sw.Height = QUICK_COLOR_SWATCH_SIZE
+        sw.Margin = Thickness(QUICK_COLOR_SWATCH_MARGIN)
         sw.CornerRadius = CornerRadius(3)
         sw.BorderThickness = Thickness(1)
         sw.BorderBrush = Media.Brushes.Gray
