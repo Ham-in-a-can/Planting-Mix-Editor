@@ -540,9 +540,21 @@ def pick_color_with_revit_dialog(initial_dbcolor, owner_window=None):
 
             result = dlg.Show()
             dialog_was_shown = True
-            if result:
-                col = dlg.SelectedColor
-                if col is not None and col.IsValidObject:
+
+            # Some Revit/IronPython combinations return None from Show() even
+            # after OK, but still update SelectedColor. Treat only an explicit
+            # False as cancel; otherwise read the selected Revit DB.Color.
+            if result is False:
+                return None
+
+            col = dlg.SelectedColor
+            if col is not None:
+                is_valid = True
+                try:
+                    is_valid = col.IsValidObject
+                except Exception:
+                    is_valid = True
+                if is_valid:
                     return col
             return None
         except Exception:
