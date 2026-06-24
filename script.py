@@ -494,9 +494,54 @@ def _dbcolor_to_media_brush(db_color):
         return Media.SolidColorBrush(Media.Colors.LightGray)
 
 
-def pick_color_with_revit_dialog(initial_dbcolor):
+def _is_valid_dbcolor(db_color):
+    """Return True when db_color behaves like an Autodesk.Revit.DB.Color."""
+    if db_color is None:
+        return False
+    try:
+        # Revit.DB.Color does not consistently expose IsValidObject across versions;
+        # accessing RGB channels is the most reliable validation here.
+        int(db_color.Red)
+        int(db_color.Green)
+        int(db_color.Blue)
+        return True
+    except Exception:
+        return False
+
+
+def _reactivate_window(window):
+    """Best-effort attempt to bring the main WPF window back to the front."""
+    if window is None:
+        return
+    try:
+        if not window.IsVisible:
+            return
+    except Exception:
+        pass
+    try:
+        if window.WindowState == System.Windows.WindowState.Minimized:
+            window.WindowState = System.Windows.WindowState.Normal
+    except Exception:
+        pass
+    try:
+        # Toggle Topmost to nudge Windows into bringing this modeless-looking
+        # pyRevit dialog above Revit after native modal dialogs close.
+        old_topmost = window.Topmost
+        window.Topmost = True
+        window.Activate()
+        window.Focus()
+        window.Topmost = old_topmost
+    except Exception:
+        try:
+            window.Activate()
+        except Exception:
+            pass
+
+
+def pick_color_with_revit_dialog(initial_dbcolor, owner_window=None):
     """Try Revit's ColorSelectionDialog, then WinForms ColorDialog. Returns DB.Color or None."""
     if HAS_REVIT_COLOR_DIALOG:
+        shown_revit_dialog = False
         try:
             dlg = ColorSelectionDialog()
             if initial_dbcolor is not None:
@@ -504,18 +549,34 @@ def pick_color_with_revit_dialog(initial_dbcolor):
                     dlg.SelectedColor = initial_dbcolor
                 except Exception:
                     pass
+
+            dialog_result = None
             try:
-                ColorSelectionDialog.Show(dlg)
+                dialog_result = dlg.Show()
+                shown_revit_dialog = True
             except Exception:
                 try:
-                    dlg.Show()
+                    dialog_result = ColorSelectionDialog.Show(dlg)
+                    shown_revit_dialog = True
                 except Exception:
                     pass
+
+            # If the native Revit dialog was shown and cancelled, do not fall
+            # through to the WinForms dialog (that caused a second colour picker).
+            if dialog_result is False:
+                return None
+
             col = dlg.SelectedColor
-            if col is not None and col.IsValidObject:
+            if _is_valid_dbcolor(col):
                 return col
+
+            if shown_revit_dialog:
+                return None
         except Exception:
-            pass
+            if shown_revit_dialog:
+                return None
+        finally:
+            _reactivate_window(owner_window)
 
     # Fallback: WinForms
     try:
@@ -544,7 +605,7 @@ def pick_color_with_revit_dialog(initial_dbcolor):
         return None
 
 
-def pick_area_color_with_palette(initial_dbcolor):
+def pick_area_color_with_palette(initial_dbcolor, owner_window=None):
     """Small palette window + 'More colours...' button. Returns DB.Color or None."""
     selected = {'color': None}
 
@@ -553,6 +614,12 @@ def pick_area_color_with_palette(initial_dbcolor):
     win.SizeToContent = SizeToContent.WidthAndHeight
     win.WindowStartupLocation = WindowStartupLocation.CenterScreen
     win.ResizeMode = 0  # NoResize
+    if owner_window is not None:
+        try:
+            win.Owner = owner_window
+            win.WindowStartupLocation = WindowStartupLocation.CenterOwner
+        except Exception:
+            pass
 
     root = StackPanel()
     root.Margin = Thickness(10)
@@ -596,7 +663,7 @@ def pick_area_color_with_palette(initial_dbcolor):
     more_btn.Padding = Thickness(6, 2, 6, 2)
 
     def on_more(sender, args):
-        col = pick_color_with_revit_dialog(initial_dbcolor)
+        col = pick_color_with_revit_dialog(initial_dbcolor, owner_window)
         if col is not None:
             selected['color'] = col
             try:
@@ -628,7 +695,7 @@ def _sanitize_mix_name_for_type(mix_name):
     base = _to_unicode(mix_name).strip()
     if not base:
         base = u'Unnamed'
-    for ch in u'<>:"/\|?*':
+    for ch in u'<>:"/\\|?*':
         base = base.replace(ch, u'_')
     return base
 
@@ -2330,7 +2397,10 @@ class MixWindowController(object):
         if curr_dbcol is None:
             curr_dbcol = getattr(mix, 'area_color_dbcolor', None)
 
-        new_dbcol = pick_area_color_with_palette(curr_dbcol)
+        try:
+            new_dbcol = pick_area_color_with_palette(curr_dbcol, self.window)
+        finally:
+            _reactivate_window(self.window)
         if new_dbcol is None:
             return
 
