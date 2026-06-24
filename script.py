@@ -503,9 +503,33 @@ def _dbcolor_to_media_brush(db_color):
         return Media.SolidColorBrush(Media.Colors.LightGray)
 
 
-def pick_color_with_revit_dialog(initial_dbcolor):
+def _reactivate_window(window):
+    """Best-effort focus helper for returning to the mix schedules window."""
+    if window is None:
+        return
+    try:
+        if window.WindowState == System.Windows.WindowState.Minimized:
+            window.WindowState = System.Windows.WindowState.Normal
+    except Exception:
+        pass
+    try:
+        window.Activate()
+    except Exception:
+        pass
+    try:
+        # A brief Topmost toggle helps WPF reclaim focus after native Revit dialogs
+        # without leaving the editor permanently above every other window.
+        window.Topmost = True
+        window.Topmost = False
+        window.Focus()
+    except Exception:
+        pass
+
+
+def pick_color_with_revit_dialog(initial_dbcolor, owner_window=None):
     """Try Revit's ColorSelectionDialog, then WinForms ColorDialog. Returns DB.Color or None."""
     if HAS_REVIT_COLOR_DIALOG:
+        dialog_was_shown = False
         try:
             dlg = ColorSelectionDialog()
             if initial_dbcolor is not None:
@@ -513,18 +537,21 @@ def pick_color_with_revit_dialog(initial_dbcolor):
                     dlg.SelectedColor = initial_dbcolor
                 except Exception:
                     pass
-            try:
-                ColorSelectionDialog.Show(dlg)
-            except Exception:
-                try:
-                    dlg.Show()
-                except Exception:
-                    pass
-            col = dlg.SelectedColor
-            if col is not None and col.IsValidObject:
-                return col
+
+            result = dlg.Show()
+            dialog_was_shown = True
+            if result:
+                col = dlg.SelectedColor
+                if col is not None and col.IsValidObject:
+                    return col
+            return None
         except Exception:
-            pass
+            # Only fall back to WinForms if Revit's picker could not be displayed.
+            # If it displayed and the user cancelled, do not open a second picker.
+            if dialog_was_shown:
+                return None
+        finally:
+            _reactivate_window(owner_window)
 
     # Fallback: WinForms
     try:
@@ -553,7 +580,7 @@ def pick_color_with_revit_dialog(initial_dbcolor):
         return None
 
 
-def pick_area_color_with_palette(initial_dbcolor):
+def pick_area_color_with_palette(initial_dbcolor, owner_window=None):
     """Small palette window + 'More colours...' button. Returns DB.Color or None."""
     selected = {'color': None}
 
@@ -562,6 +589,11 @@ def pick_area_color_with_palette(initial_dbcolor):
     win.SizeToContent = SizeToContent.WidthAndHeight
     win.WindowStartupLocation = WindowStartupLocation.CenterScreen
     win.ResizeMode = 0  # NoResize
+    if owner_window is not None:
+        try:
+            win.Owner = owner_window
+        except Exception:
+            pass
 
     root = StackPanel()
     root.Margin = Thickness(10)
@@ -605,7 +637,7 @@ def pick_area_color_with_palette(initial_dbcolor):
     more_btn.Padding = Thickness(6, 2, 6, 2)
 
     def on_more(sender, args):
-        col = pick_color_with_revit_dialog(initial_dbcolor)
+        col = pick_color_with_revit_dialog(initial_dbcolor, owner_window or win)
         if col is not None:
             selected['color'] = col
             try:
@@ -618,6 +650,7 @@ def pick_area_color_with_palette(initial_dbcolor):
             except Exception:
                 pass
         win.Close()
+        _reactivate_window(owner_window)
 
     more_btn.Click += on_more
     root.Children.Add(more_btn)
@@ -626,6 +659,8 @@ def pick_area_color_with_palette(initial_dbcolor):
         result = win.ShowDialog()
     except Exception:
         result = None
+    finally:
+        _reactivate_window(owner_window)
 
     if result:
         return selected['color']
@@ -2711,7 +2746,7 @@ class MixWindowController(object):
         if curr_dbcol is None:
             curr_dbcol = getattr(mix, 'area_color_dbcolor', None)
 
-        new_dbcol = pick_area_color_with_palette(curr_dbcol)
+        new_dbcol = pick_area_color_with_palette(curr_dbcol, self.window)
         if new_dbcol is None:
             return
 
