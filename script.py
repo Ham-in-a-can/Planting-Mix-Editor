@@ -959,7 +959,7 @@ def _ensure_filled_region_for_mix(doc, mix_name, color, host_view):
         )
 
 # ---- Percent conversions ----
-def pct_raw_to_display(raw):
+def pct_raw_to_display(raw, assume_internal_decimal=False):
     """Convert stored decimal or percent value to a display string like '50%'.
 
     Revit percentage parameters are stored internally as decimal fractions
@@ -967,6 +967,10 @@ def pct_raw_to_display(raw):
     a percent sign (for example '1%'). Values that already look like percent
     text must be displayed exactly as percent values; otherwise '1%' would be
     interpreted as an internal decimal and incorrectly shown as '100%'.
+
+    When normalising a value that was just produced by pct_display_to_raw, pass
+    assume_internal_decimal=True so an entered 100 becomes raw 1.0 and displays
+    again as 100%, while an entered 1 becomes raw 0.01 and displays as 1%.
     """
     s = _to_unicode(raw).strip()
     if not s:
@@ -986,6 +990,8 @@ def pct_raw_to_display(raw):
         return u''
     if has_percent_sign:
         perc = val
+    elif assume_internal_decimal:
+        perc = val * 100.0
     elif abs(val) < 1.0 - 1e-9:
         perc = val * 100.0
     else:
@@ -3005,7 +3011,7 @@ class MixWindowController(object):
                 self._update_mix_percent_summary(mix)
                 self._update_approx_numbers_for_mix(mix)
             return
-        display = pct_raw_to_display(raw)
+        display = pct_raw_to_display(raw, assume_internal_decimal=True)
         if 0 <= row_index < len(mix.rows):
             mix.rows[row_index].pct = display
         if display != text:
