@@ -532,6 +532,31 @@ def _reactivate_window(window):
         pass
 
 
+def _is_revit_color_dialog_cancelled(result):
+    """Return True when ColorSelectionDialog.Show reports an explicit cancel."""
+    if result is False:
+        return True
+    if result is None:
+        return False
+
+    try:
+        if result == ItemSelectionDialogResult.Canceled:
+            return True
+    except Exception:
+        pass
+
+    try:
+        result_text = result.ToString()
+    except Exception:
+        try:
+            result_text = str(result)
+        except Exception:
+            result_text = u''
+
+    result_text = _to_unicode(result_text).lower()
+    return result_text.endswith('canceled') or result_text.endswith('cancelled')
+
+
 def pick_color_with_revit_dialog(initial_dbcolor, owner_window=None):
     """Try Revit's ColorSelectionDialog, then WinForms ColorDialog. Returns DB.Color or None."""
     if HAS_REVIT_COLOR_DIALOG:
@@ -547,10 +572,9 @@ def pick_color_with_revit_dialog(initial_dbcolor, owner_window=None):
             result = dlg.Show()
             dialog_was_shown = True
 
-            # Some Revit/IronPython combinations return None from Show() even
-            # after OK, but still update SelectedColor. Treat only an explicit
-            # False as cancel; otherwise read the selected Revit DB.Color.
-            if result is False:
+            # Revit returns ItemSelectionDialogResult. Canceled is an enum value
+            # (not False), so check it explicitly before reading SelectedColor.
+            if _is_revit_color_dialog_cancelled(result):
                 return None
 
             col = dlg.SelectedColor
