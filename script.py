@@ -141,8 +141,8 @@ FILLED_REGION_HEIGHT_MM = 4.0
 DEBUG_FILLED_REGION = False
 
 
-#Path to plant library script
-CREATE_PLANT_SCRIPT_PATH = r"C:\Users\hamishc\OneDrive - Boffa Miskell\Desktop\Shared_Dynamo\ToolBar\OnServer\BoffaTestTools.extension\BoffaTools.tab\Test.panel\Create Plant.pushbutton\script.py"
+# Final fallback only; normal resolution is relative to this pushbutton/extension.
+CREATE_PLANT_SCRIPT_PATH_FALLBACK = r"C:\Users\hamishc\OneDrive - Boffa Miskell\Desktop\Shared_Dynamo\ToolBar\OnServer\BoffaTestTools.extension\BoffaTools.tab\Test.panel\Create Plant.pushbutton\script.py"
 
 
 # Path to XAML file (placed next to this script)
@@ -337,6 +337,117 @@ def _hash_log_value(value):
         return u''
 
 
+
+def _find_extension_root(start_dir):
+    """Walk upward from start_dir to find the containing .extension folder."""
+    root = os.path.normpath(_to_unicode(start_dir))
+    while root:
+        try:
+            if root.lower().endswith('.extension'):
+                return root
+        except Exception:
+            pass
+        parent = os.path.dirname(root)
+        if not parent or parent == root:
+            break
+        root = parent
+    return None
+
+
+def _find_existing_logs_above(start_dir):
+    """Find an already-existing logs folder above start_dir without creating one."""
+    root = os.path.normpath(_to_unicode(start_dir))
+    while root:
+        candidate = os.path.join(root, 'logs')
+        if os.path.isdir(candidate):
+            return candidate
+        parent = os.path.dirname(root)
+        if not parent or parent == root:
+            break
+        root = parent
+    return None
+
+
+def _resolve_create_plant_script_path():
+    """Resolve the sibling Create Plant pushbutton script without relying on user paths."""
+    attempts = []
+
+    def _record(candidate, reason):
+        if not candidate:
+            return None
+        candidate = os.path.normpath(candidate)
+        attempts.append(u'{0}: {1}'.format(reason, candidate))
+        if os.path.exists(candidate):
+            LOGGER.info('MIX LIBRARY: resolved Create Plant script path: {0}'.format(candidate))
+            _resolve_create_plant_script_path.attempts = attempts
+            return candidate
+        return None
+
+    try:
+        panel_dir = os.path.dirname(SCRIPT_DIR)
+        found = _record(os.path.join(panel_dir, 'Create Plant.pushbutton', 'script.py'), 'sibling pushbutton')
+        if found:
+            return found
+    except Exception:
+        pass
+
+    extension_root = _find_extension_root(SCRIPT_DIR)
+    search_roots = []
+    if extension_root:
+        search_roots.append(('extension search', extension_root))
+        parent = os.path.dirname(extension_root)
+        if parent:
+            search_roots.append(('extension parent search', parent))
+
+    for reason, root in search_roots:
+        try:
+            for dirpath, dirnames, filenames in os.walk(root):
+                if os.path.basename(dirpath).lower() == 'create plant.pushbutton':
+                    found = _record(os.path.join(dirpath, 'script.py'), reason)
+                    if found:
+                        return found
+        except Exception as ex:
+            attempts.append(u'{0} failed: {1}'.format(reason, ex))
+
+    try:
+        found = _record(CREATE_PLANT_SCRIPT_PATH_FALLBACK, 'absolute fallback')
+        if found:
+            return found
+    except Exception:
+        pass
+
+    _resolve_create_plant_script_path.attempts = attempts
+    LOGGER.warning('MIX LIBRARY: could not resolve Create Plant script path.')
+    return None
+
+
+def _format_create_plant_resolution_attempts():
+    attempts = getattr(_resolve_create_plant_script_path, 'attempts', [])
+    if not attempts:
+        return u'(no search attempts recorded)'
+    return u'\n'.join([u' - {0}'.format(a) for a in attempts])
+
+
+def _load_create_plant_module(module_name):
+    create_plant_script_path = _resolve_create_plant_script_path()
+    if not create_plant_script_path:
+        return None, None
+    pushbutton_dir = os.path.dirname(create_plant_script_path)
+    old_path = list(sys.path)
+    try:
+        if pushbutton_dir in sys.path:
+            sys.path.remove(pushbutton_dir)
+        sys.path.insert(0, pushbutton_dir)
+        if module_name in sys.modules:
+            del sys.modules[module_name]
+        module = imp.load_source(module_name, create_plant_script_path)
+        return module, create_plant_script_path
+    finally:
+        try:
+            sys.path[:] = old_path
+        except Exception:
+            pass
+
 def _get_doc_path(doc):
     try:
         return doc.GetWorksharingCentralModelPath().ToString()
@@ -349,42 +460,29 @@ def _get_doc_path(doc):
 
 
 def _resolve_mix_root_logs_folder():
-    """Resolve the shared root logs folder used for plant usage CSV logs."""
+    """Resolve the shared root logs folder used by the toolbar/Plant Library."""
+    extension_root = _find_extension_root(SCRIPT_DIR)
     candidates = []
 
-    try:
-        resolver = globals().get('resolve_root_logs_folder') or globals().get('get_root_logs_folder')
-        if resolver:
-            candidates.append(resolver())
-    except Exception:
-        pass
+    if extension_root:
+        toolbar_root = os.path.dirname(extension_root)
+        candidates.append(('shared extension-parent logs folder', os.path.join(toolbar_root, 'logs'), False))
 
-    try:
-        root = SCRIPT_DIR
-        for _ in range(8):
-            if not root:
-                break
-            candidates.append(os.path.join(root, 'logs'))
-            parent = os.path.dirname(root)
-            if parent and parent != root:
-                candidates.append(os.path.join(parent, 'logs'))
-            if root.lower().endswith('.extension'):
-                candidates.append(os.path.join(root, 'logs'))
-                break
-            if parent == root:
-                break
-            root = parent
-    except Exception:
-        pass
+    if not extension_root:
+        try:
+            cwd_logs = os.path.join(os.getcwd(), 'logs')
+            candidates.append(('current working directory fallback logs folder', cwd_logs, False))
+        except Exception:
+            pass
 
-    try:
-        candidates.append(os.path.join(os.path.expanduser('~'), 'Documents', 'BoffaLogs', 'logs'))
-    except Exception:
-        pass
-    candidates.append(os.path.join(SCRIPT_DIR, 'logs'))
+    existing_above = _find_existing_logs_above(SCRIPT_DIR)
+    if existing_above:
+        candidates.append(('existing logs folder found above script', existing_above, False))
+
+    candidates.append(('pushbutton-local fallback logs folder', os.path.join(SCRIPT_DIR, 'logs'), True))
 
     seen = set()
-    for folder in candidates:
+    for reason, folder, is_pushbutton_local in candidates:
         folder = _to_unicode(folder).strip()
         if not folder:
             continue
@@ -396,20 +494,22 @@ def _resolve_mix_root_logs_folder():
         try:
             if not os.path.exists(norm):
                 os.makedirs(norm)
-            LOGGER.info('MIX LOGS: using root logs folder: {0}'.format(norm))
+            if is_pushbutton_local:
+                LOGGER.warning('MIX LOGS WARNING: using pushbutton-local fallback logs folder.')
+            LOGGER.info('MIX LOGS: using {0}: {1}'.format(reason, norm))
             LOGGER.info('MIX LOGS: plant usage log path: {0}'.format(os.path.join(norm, 'plant_usage_log.csv')))
             return norm
         except Exception as ex:
-            LOGGER.debug('MIX LOGS: could not use logs folder {0}: {1}'.format(norm, ex))
+            LOGGER.warning('MIX LOGS: could not use {0} {1}: {2}'.format(reason, norm, ex))
 
+    LOGGER.warning('MIX LOGS WARNING: using SCRIPT_DIR as final logs fallback: {0}'.format(SCRIPT_DIR))
     return SCRIPT_DIR
 
-
 PLANT_USAGE_LOG_BASE_COLUMNS = [
-    'timestamp', 'timestamp_utc', 'user', 'project_number', 'project_name',
-    'model_title', 'document_title', 'revit_version', 'central_model_path_hash',
-    'model_name_hash', 'botanical', 'common', 'plant_code', 'source_sheet',
-    'family_name'
+    'timestamp_utc', 'sheet', 'botanical', 'common', 'plant_grade', 'user',
+    'project_number', 'project_name', 'timestamp', 'model_title',
+    'document_title', 'revit_version', 'central_model_path_hash',
+    'model_name_hash', 'plant_code', 'source_sheet', 'family_name'
 ]
 
 PLANT_USAGE_LOG_MIX_COLUMNS = [
@@ -560,8 +660,10 @@ def _build_mix_usage_rows(doc, mixes, target_view, session_id):
                 'revit_version': revit_version,
                 'central_model_path_hash': _hash_log_value(doc_path),
                 'model_name_hash': _hash_log_value(doc_title),
+                'sheet': 'Mix Editor',
                 'botanical': row.bot or u'',
                 'common': row.com or u'',
+                'plant_grade': row.grade or u'',
                 'plant_code': row.code or u'',
                 'source_sheet': u'',
                 'family_name': u'',
@@ -589,23 +691,37 @@ def _build_mix_usage_rows(doc, mixes, target_view, session_id):
     return rows
 
 
-def _append_mix_usage_log_rows(doc, mixes, target_view, session_id):
+
+def _log_mix_usage_diagnostics(path, file_existed_before, existing_header, merged_header, new_rows):
     try:
-        root = _resolve_mix_root_logs_folder()
-        path = os.path.join(root, 'plant_usage_log.csv')
-        new_rows = _build_mix_usage_rows(doc, mixes, target_view, session_id)
-        if not new_rows:
-            return
-        existing_header, existing_rows = _read_existing_usage_log(path)
-        header = []
-        for col in existing_header + PLANT_USAGE_LOG_BASE_COLUMNS + PLANT_USAGE_LOG_MIX_COLUMNS:
-            if col and col not in header:
-                header.append(col)
-        all_rows = existing_rows + new_rows
-        _write_csv_atomic(path, header, all_rows)
-        LOGGER.info('MIX LOGS: wrote {0} mix usage rows to {1}'.format(len(new_rows), path))
+        LOGGER.info('MIX LOGS DIAGNOSTIC: resolved usage log path: {0}'.format(path))
+        LOGGER.info('MIX LOGS DIAGNOSTIC: file existed before write: {0}'.format(file_existed_before))
+        LOGGER.info('MIX LOGS DIAGNOSTIC: old header column count: {0}'.format(len(existing_header or [])))
+        LOGGER.info('MIX LOGS DIAGNOSTIC: merged header column count: {0}'.format(len(merged_header or [])))
+        LOGGER.info('MIX LOGS DIAGNOSTIC: new row count: {0}'.format(len(new_rows or [])))
+        if os.path.exists(path):
+            LOGGER.info('MIX LOGS DIAGNOSTIC: final file size: {0}'.format(os.path.getsize(path)))
     except Exception as ex:
-        LOGGER.debug('MIX LOGS: failed to write mix usage log rows: {0}'.format(ex))
+        LOGGER.warning('MIX LOGS: failed to write diagnostics: {0}'.format(ex))
+
+def _append_mix_usage_log_rows(doc, mixes, target_view, session_id):
+    root = _resolve_mix_root_logs_folder()
+    path = os.path.join(root, 'plant_usage_log.csv')
+    file_existed_before = os.path.exists(path)
+    new_rows = _build_mix_usage_rows(doc, mixes, target_view, session_id)
+    if not new_rows:
+        LOGGER.info('MIX LOGS: no non-empty mix species rows found to log.')
+        _log_mix_usage_diagnostics(path, file_existed_before, [], [], new_rows)
+        return
+    existing_header, existing_rows = _read_existing_usage_log(path)
+    header = []
+    for col in existing_header + PLANT_USAGE_LOG_BASE_COLUMNS + PLANT_USAGE_LOG_MIX_COLUMNS:
+        if col and col not in header:
+            header.append(col)
+    all_rows = existing_rows + new_rows
+    _write_csv_atomic(path, header, all_rows)
+    LOGGER.info('MIX LOGS: appended {0} mix usage rows to {1}'.format(len(new_rows), path))
+    _log_mix_usage_diagnostics(path, file_existed_before, existing_header, header, new_rows)
 
 def get_param(element, name):
     """Safe parameter getter returning a Python string or None."""
@@ -1640,9 +1756,11 @@ class MixWindowController(object):
     # ---- Plant Library ----
     def _run_create_plant_script(self):
         """Run the Create Plant pushbutton script from Mix Editor."""
-        if not os.path.exists(CREATE_PLANT_SCRIPT_PATH):
+        create_plant_path = _resolve_create_plant_script_path()
+        if not create_plant_path:
             forms.alert(
-                u"Could not find Create Plant script at:\n{0}".format(CREATE_PLANT_SCRIPT_PATH),
+                u"Could not find Create Plant script. Search attempts:\n{0}"
+                .format(_format_create_plant_resolution_attempts()),
                 title="Add Plant (library)"
             )
             return
@@ -1650,7 +1768,7 @@ class MixWindowController(object):
         try:
             # Load as a uniquely-named module so it doesn't clash with this script.py
             # Loading it will execute its top-level code, just like pressing its own button.
-            imp.load_source("create_plant_pushbutton_script", CREATE_PLANT_SCRIPT_PATH)
+            _load_create_plant_module("create_plant_pushbutton_script")
         except Exception as ex:
             forms.alert(
                 u"Error while running Create Plant script:\n{0}".format(ex),
@@ -3415,15 +3533,17 @@ class MixWindowController(object):
         # ------------------------------------------------------------
         # 1. Load the Create Plant script as a module
         # ------------------------------------------------------------
-        if not os.path.exists(CREATE_PLANT_SCRIPT_PATH):
+        create_plant_path = _resolve_create_plant_script_path()
+        if not create_plant_path:
             forms.alert(
-                u"Could not find Create Plant script at:\n{0}".format(CREATE_PLANT_SCRIPT_PATH),
+                u"Could not find Create Plant script. Search attempts:\n{0}"
+                .format(_format_create_plant_resolution_attempts()),
                 title="Add Plant (library)"
             )
             return
 
         try:
-            plant_library = imp.load_source("plant_library_for_mix", CREATE_PLANT_SCRIPT_PATH)
+            plant_library, _loaded_path = _load_create_plant_module("plant_library_for_mix")
         except Exception as ex:
             forms.alert(
                 u"Error loading Create Plant script:\n{0}".format(ex),
@@ -3940,22 +4060,32 @@ class MixWindowController(object):
             self._apply_color_scheme_color_updates()
             self._update_filled_region_strips()
 
-            target_view_for_log = self._get_target_view()
             t.Commit()
-            _append_mix_usage_log_rows(self.doc, self.mixes, target_view_for_log, self._mix_log_session_id)
-            self._area_totals_by_mix_key = self._load_area_totals_by_mix_name()
-            self._update_all_approx_numbers()
-            # After committing, show a debug popup with everything we logged
-            show_fr_debug_popup()
-
 
         except Exception as ex:
             try:
-                t.RollBack()
+                should_rollback = True
+                try:
+                    should_rollback = t.HasStarted() and not t.HasEnded()
+                except Exception:
+                    pass
+                if should_rollback:
+                    t.RollBack()
             except Exception:
                 pass
             forms.alert('Failed to update mix schedules:\n{0}'.format(ex))
             return
+
+        try:
+            target_view_for_log = self._get_target_view()
+            _append_mix_usage_log_rows(self.doc, self.mixes, target_view_for_log, self._mix_log_session_id)
+        except Exception as log_ex:
+            LOGGER.warning('MIX LOGS: failed after Apply: {0}'.format(log_ex))
+
+        self._area_totals_by_mix_key = self._load_area_totals_by_mix_name()
+        self._update_all_approx_numbers()
+        # After committing, show a debug popup with everything we logged
+        show_fr_debug_popup()
 
         LOGGER.info(
             'Mix schedules, related Areas, Area names, Area colours, '
