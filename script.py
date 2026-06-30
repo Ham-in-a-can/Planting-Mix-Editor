@@ -16,6 +16,13 @@ Adds:
 import os
 import sys
 import imp
+import csv
+import uuid
+import shutil
+import hashlib
+import getpass
+import tempfile
+import datetime
 import clr
 
 from pyrevit import revit, DB, script, forms
@@ -314,6 +321,291 @@ def _to_unicode(value):
         except Exception:
             return u''
 
+
+
+def _hash_log_value(value):
+    text = _to_unicode(value).strip()
+    if not text:
+        return u''
+    try:
+        data = text.encode('utf-8')
+    except Exception:
+        data = str(text)
+    try:
+        return hashlib.sha256(data).hexdigest()
+    except Exception:
+        return u''
+
+
+def _get_doc_path(doc):
+    try:
+        return doc.GetWorksharingCentralModelPath().ToString()
+    except Exception:
+        pass
+    try:
+        return doc.PathName
+    except Exception:
+        return u''
+
+
+def _resolve_mix_root_logs_folder():
+    """Resolve the shared root logs folder used for plant usage CSV logs."""
+    candidates = []
+
+    try:
+        resolver = globals().get('resolve_root_logs_folder') or globals().get('get_root_logs_folder')
+        if resolver:
+            candidates.append(resolver())
+    except Exception:
+        pass
+
+    try:
+        root = SCRIPT_DIR
+        for _ in range(8):
+            if not root:
+                break
+            candidates.append(os.path.join(root, 'logs'))
+            parent = os.path.dirname(root)
+            if parent and parent != root:
+                candidates.append(os.path.join(parent, 'logs'))
+            if root.lower().endswith('.extension'):
+                candidates.append(os.path.join(root, 'logs'))
+                break
+            if parent == root:
+                break
+            root = parent
+    except Exception:
+        pass
+
+    try:
+        candidates.append(os.path.join(os.path.expanduser('~'), 'Documents', 'BoffaLogs', 'logs'))
+    except Exception:
+        pass
+    candidates.append(os.path.join(SCRIPT_DIR, 'logs'))
+
+    seen = set()
+    for folder in candidates:
+        folder = _to_unicode(folder).strip()
+        if not folder:
+            continue
+        norm = os.path.normpath(folder)
+        key = norm.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if not os.path.exists(norm):
+                os.makedirs(norm)
+            LOGGER.info('MIX LOGS: using root logs folder: {0}'.format(norm))
+            LOGGER.info('MIX LOGS: plant usage log path: {0}'.format(os.path.join(norm, 'plant_usage_log.csv')))
+            return norm
+        except Exception as ex:
+            LOGGER.debug('MIX LOGS: could not use logs folder {0}: {1}'.format(norm, ex))
+
+    return SCRIPT_DIR
+
+
+PLANT_USAGE_LOG_BASE_COLUMNS = [
+    'timestamp', 'timestamp_utc', 'user', 'project_number', 'project_name',
+    'model_title', 'document_title', 'revit_version', 'central_model_path_hash',
+    'model_name_hash', 'botanical', 'common', 'plant_code', 'source_sheet',
+    'family_name'
+]
+
+PLANT_USAGE_LOG_MIX_COLUMNS = [
+    'usage_event_type', 'source_tool', 'mode', 'mix_name', 'mix_element_id_hash',
+    'mix_unique_id_hash', 'target_view_name', 'target_view_id_hash',
+    'mix_family_name', 'mix_species_index', 'mix_species_count', 'mix_percent',
+    'mix_spacing', 'mix_grade', 'mix_code', 'mix_botanical', 'mix_common',
+    'applied_to_revit', 'session_id'
+]
+
+
+def _csv_cell(value):
+    text = _to_unicode(value)
+    return u'"' + text.replace(u'"', u'""') + u'"'
+
+
+def _write_csv_atomic(path, header, rows):
+    folder = os.path.dirname(path)
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+    fd, tmp_path = tempfile.mkstemp(prefix='plant_usage_', suffix='.csv', dir=folder)
+    os.close(fd)
+    try:
+        with open(tmp_path, 'wb') as fh:
+            lines = []
+            lines.append(u','.join([_csv_cell(h) for h in header]))
+            for row in rows:
+                lines.append(u','.join([_csv_cell(row.get(h, u'')) for h in header]))
+            data = (u'\n'.join(lines) + u'\n').encode('utf-8')
+            fh.write(data)
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+        shutil.move(tmp_path, path)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def _read_existing_usage_log(path):
+    if not os.path.exists(path):
+        return [], []
+    try:
+        with open(path, 'rb') as fh:
+            data = fh.read()
+        try:
+            text = data.decode('utf-8-sig')
+        except Exception:
+            text = data.decode('utf-8', 'ignore')
+        lines = text.splitlines()
+        if not lines:
+            return [], []
+        reader = csv.DictReader(lines)
+        header = list(reader.fieldnames or [])
+        rows = []
+        for row in reader:
+            clean = {}
+            for k, v in row.items():
+                if k is not None:
+                    clean[_to_unicode(k)] = _to_unicode(v)
+            rows.append(clean)
+        return header, rows
+    except Exception as ex:
+        LOGGER.debug('MIX LOGS: failed to read existing plant usage log: {0}'.format(ex))
+        return [], []
+
+
+def _doc_project_info(doc):
+    info = {}
+    try:
+        pi = doc.ProjectInformation
+    except Exception:
+        pi = None
+    for key, param_name in (('project_number', 'Project Number'), ('project_name', 'Project Name')):
+        val = u''
+        try:
+            val = get_param(pi, param_name)
+        except Exception:
+            val = u''
+        info[key] = val or u''
+    return info
+
+
+def _build_mix_usage_rows(doc, mixes, target_view, session_id):
+    now_local = datetime.datetime.now()
+    now_utc = datetime.datetime.utcnow()
+    project_info = _doc_project_info(doc)
+    doc_path = _get_doc_path(doc)
+    try:
+        revit_version = __revit__.Application.VersionNumber
+    except Exception:
+        revit_version = u''
+    try:
+        user_name = __revit__.Application.Username
+    except Exception:
+        try:
+            user_name = getpass.getuser()
+        except Exception:
+            user_name = u''
+    try:
+        doc_title = doc.Title
+    except Exception:
+        doc_title = u''
+    target_view_name = u''
+    target_view_id_hash = u''
+    if target_view is not None:
+        try:
+            target_view_name = target_view.Name
+        except Exception:
+            pass
+        try:
+            target_view_id_hash = _hash_log_value(_get_element_id_int(target_view.Id))
+        except Exception:
+            pass
+
+    rows = []
+    for mix in mixes:
+        species = [r for r in mix.rows if (r.code or r.bot or r.com)]
+        species_count = len(species)
+        if species_count <= 0:
+            continue
+        try:
+            mix_element_id_hash = _hash_log_value(_get_element_id_int(mix.element.Id))
+        except Exception:
+            mix_element_id_hash = u''
+        try:
+            mix_unique_id_hash = _hash_log_value(mix.element.UniqueId)
+        except Exception:
+            mix_unique_id_hash = u''
+        idx = 0
+        for row in mix.rows:
+            if not (row.code or row.bot or row.com):
+                continue
+            idx += 1
+            log_row = {
+                'timestamp': now_local.strftime('%Y-%m-%d %H:%M:%S'),
+                'timestamp_utc': now_utc.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'user': user_name,
+                'project_number': project_info.get('project_number', u''),
+                'project_name': project_info.get('project_name', u''),
+                'model_title': doc_title,
+                'document_title': doc_title,
+                'revit_version': revit_version,
+                'central_model_path_hash': _hash_log_value(doc_path),
+                'model_name_hash': _hash_log_value(doc_title),
+                'botanical': row.bot or u'',
+                'common': row.com or u'',
+                'plant_code': row.code or u'',
+                'source_sheet': u'',
+                'family_name': u'',
+                'usage_event_type': 'mix_species_applied_to_revit',
+                'source_tool': 'Planting Mix Editor',
+                'mode': 'mix_editor_apply',
+                'mix_name': mix.mix_name or u'',
+                'mix_element_id_hash': mix_element_id_hash,
+                'mix_unique_id_hash': mix_unique_id_hash,
+                'target_view_name': target_view_name,
+                'target_view_id_hash': target_view_id_hash,
+                'mix_family_name': FAMILY_NAME,
+                'mix_species_index': idx,
+                'mix_species_count': species_count,
+                'mix_percent': row.pct or u'',
+                'mix_spacing': row.spacing or u'',
+                'mix_grade': row.grade or u'',
+                'mix_code': row.code or u'',
+                'mix_botanical': row.bot or u'',
+                'mix_common': row.com or u'',
+                'applied_to_revit': 'true',
+                'session_id': session_id
+            }
+            rows.append(log_row)
+    return rows
+
+
+def _append_mix_usage_log_rows(doc, mixes, target_view, session_id):
+    try:
+        root = _resolve_mix_root_logs_folder()
+        path = os.path.join(root, 'plant_usage_log.csv')
+        new_rows = _build_mix_usage_rows(doc, mixes, target_view, session_id)
+        if not new_rows:
+            return
+        existing_header, existing_rows = _read_existing_usage_log(path)
+        header = []
+        for col in existing_header + PLANT_USAGE_LOG_BASE_COLUMNS + PLANT_USAGE_LOG_MIX_COLUMNS:
+            if col and col not in header:
+                header.append(col)
+        all_rows = existing_rows + new_rows
+        _write_csv_atomic(path, header, all_rows)
+        LOGGER.info('MIX LOGS: wrote {0} mix usage rows to {1}'.format(len(new_rows), path))
+    except Exception as ex:
+        LOGGER.debug('MIX LOGS: failed to write mix usage log rows: {0}'.format(ex))
 
 def get_param(element, name):
     """Safe parameter getter returning a Python string or None."""
@@ -1320,6 +1612,7 @@ class MixWindowController(object):
         self.current_expanded = None
         self._mix_symbol = None
         self._target_view_id = None
+        self._mix_log_session_id = _to_unicode(uuid.uuid4())
 
         # For manual double-click detection on header
         self._last_header_mix = None
@@ -3149,22 +3442,69 @@ class MixWindowController(object):
         # ------------------------------------------------------------
         # 2. Call the plant picker in 'mix mode', passing context
         # ------------------------------------------------------------
+        target_view = self._get_target_view()
+        target_view_id = u''
+        target_view_name = u''
+        if target_view is not None:
+            try:
+                target_view_id = _get_element_id_int(target_view.Id)
+            except Exception:
+                target_view_id = u''
+            try:
+                target_view_name = target_view.Name
+            except Exception:
+                target_view_name = u''
+
+        mix_context = {
+            'mix_name': mix.mix_name,
+            'mix_element_id': _get_element_id_int(mix.element.Id),
+            'mix_unique_id': getattr(mix.element, 'UniqueId', u''),
+            'mix_family_name': FAMILY_NAME,
+            'target_view_id': target_view_id,
+            'target_view_name': target_view_name,
+            'current_species_count': len(mix.rows),
+            'max_species': MAX_SPECIES,
+            'max_slots': slots_left,
+            'current_total_percent': current_total_percent,
+            'percent_remaining': percent_remaining,
+            'most_common_grade': most_common_grade,
+        }
+        LOGGER.info(
+            'MIX LIBRARY: opening for mix "{0}"; species={1}; max_slots={2}; percent_remaining={3}'
+            .format(mix.mix_name, len(mix.rows), slots_left, percent_remaining)
+        )
+
         try:
             selected = plant_library.open_plant_library_dialog_for_mix(
                 max_slots=slots_left,
                 percent_remaining=percent_remaining,
                 current_total_percent=current_total_percent,
-                most_common_grade=most_common_grade
+                most_common_grade=most_common_grade,
+                mix_context=mix_context
             )
         except TypeError:
-            # Fallback if the other script still has the old signature
-            selected = plant_library.open_plant_library_dialog_for_mix()
+            try:
+                selected = plant_library.open_plant_library_dialog_for_mix(
+                    max_slots=slots_left,
+                    percent_remaining=percent_remaining,
+                    current_total_percent=current_total_percent,
+                    most_common_grade=most_common_grade
+                )
+            except TypeError:
+                # Fallback if the other script still has the old signature
+                selected = plant_library.open_plant_library_dialog_for_mix()
         except Exception as ex:
             forms.alert(
                 u"Error while running plant library dialog:\n{0}".format(ex),
                 title="Add Plant (library)"
             )
             return
+
+        selected_count = len(selected) if selected else 0
+        LOGGER.info(
+            'MIX LIBRARY: returned {0} selected plants for mix "{1}".'
+            .format(selected_count, mix.mix_name)
+        )
 
         # If user cancelled or nothing selected, do nothing
         if not selected:
@@ -3189,6 +3529,7 @@ class MixWindowController(object):
             botanical = _to_unicode(row_data.get('Botanical', u''))
             common    = _to_unicode(row_data.get('Common', u''))
             percent   = row_data.get('Percent', None)
+            spacing   = row_data.get('Spacing', None)
             grade     = row_data.get('Grade', None)
             is_groundcover = row_data.get('IsGroundcover', None)
             is_tree = row_data.get('IsTree', None)
@@ -3204,8 +3545,17 @@ class MixWindowController(object):
             else:
                 row.is_groundcover = True
 
-            # Spacing from SpreadMM (mm) -> display string (e.g. '3m')
-            if spread_mm not in (None, u''):
+            # Project mix palette values win over library spread-derived defaults.
+            if spacing not in (None, u'', ''):
+                spacing_text = _to_unicode(spacing).strip()
+                try:
+                    if u'm' in spacing_text.lower():
+                        row.spacing = space_raw_to_display(space_display_to_raw(spacing_text))
+                    else:
+                        row.spacing = space_raw_to_display(spacing_text)
+                except Exception:
+                    row.spacing = spacing_text
+            elif spread_mm not in (None, u'', ''):
                 try:
                     raw_mm_str = _to_unicode(spread_mm)
                     row.spacing = space_raw_to_display(raw_mm_str)
@@ -3214,14 +3564,15 @@ class MixWindowController(object):
             else:
                 row.spacing = u''
 
-            # Percent – convert whatever we get ('50', 50, 0.5, '50%')
-            if percent not in (None, u''):
+            # Percent – previous project mix palette values are retained exactly;
+            # otherwise use the standard new-plant default of 10%.
+            if percent not in (None, u'', ''):
                 try:
                     row.pct = pct_raw_to_display(percent)
                 except Exception:
-                    row.pct = u''
+                    row.pct = _to_unicode(percent)
             else:
-                row.pct = u''
+                row.pct = u'10%'
 
             # Grade – already a display string
             if grade not in (None, u''):
@@ -3589,7 +3940,9 @@ class MixWindowController(object):
             self._apply_color_scheme_color_updates()
             self._update_filled_region_strips()
 
+            target_view_for_log = self._get_target_view()
             t.Commit()
+            _append_mix_usage_log_rows(self.doc, self.mixes, target_view_for_log, self._mix_log_session_id)
             self._area_totals_by_mix_key = self._load_area_totals_by_mix_name()
             self._update_all_approx_numbers()
             # After committing, show a debug popup with everything we logged
