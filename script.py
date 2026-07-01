@@ -1384,18 +1384,15 @@ def _ensure_filled_region_for_mix(doc, mix_name, color, host_view):
         )
 
 # ---- Percent conversions ----
-def pct_raw_to_display(raw, assume_internal_decimal=False):
-    """Convert stored decimal or percent value to a display string like '50%'.
+def pct_raw_to_display(raw, assume_internal_decimal=True):
+    """Convert a percent value to display text like '50%'.
 
-    Revit percentage parameters are stored internally as decimal fractions
-    (0.5 = 50%), but AsValueString often returns text that already includes
-    a percent sign (for example '1%'). Values that already look like percent
-    text must be displayed exactly as percent values; otherwise '1%' would be
-    interpreted as an internal decimal and incorrectly shown as '100%'.
+    By default this treats raw values as Revit family percentage storage:
+    decimal fractions where 1.0 = 100%, 0.5 = 50%, and 0.01 = 1%.
 
-    When normalising a value that was just produced by pct_display_to_raw, pass
-    assume_internal_decimal=True so an entered 100 becomes raw 1.0 and displays
-    again as 100%, while an entered 1 becomes raw 0.01 and displays as 1%.
+    Set assume_internal_decimal=False only for already-display-style values
+    from external UI contexts where '1' means 1%, not internal 100%. Values
+    with an explicit percent sign are always treated as display percentages.
     """
     s = _to_unicode(raw).strip()
     if not s:
@@ -1455,6 +1452,40 @@ def pct_display_to_raw(display):
     if not raw_str:
         raw_str = u'0'
     return raw_str
+
+
+def pct_family_raw_to_display(raw):
+    """Convert stored Revit decimal fraction percentage to display text."""
+    return pct_raw_to_display(raw, assume_internal_decimal=True)
+
+
+def pct_user_display_to_family_raw(display):
+    """Convert user-entered display percentage to stored Revit fraction."""
+    return pct_display_to_raw(display)
+
+
+def _run_percent_and_sort_dev_checks():
+    assert pct_family_raw_to_display('1.0') == '100%'
+    assert pct_family_raw_to_display('1') == '100%'
+    assert pct_family_raw_to_display('0.01') == '1%'
+    assert pct_family_raw_to_display('0.1') == '10%'
+    assert pct_family_raw_to_display('0.5') == '50%'
+    assert pct_family_raw_to_display('0.75') == '75%'
+    assert pct_user_display_to_family_raw('1') == '0.01'
+    assert pct_user_display_to_family_raw('1%') == '0.01'
+    assert pct_user_display_to_family_raw('100%') == '1'
+
+    class _DummyRow(object):
+        pass
+    rows = []
+    for name in ('Carex testacea', 'Acaena inermis', 'Poa cita'):
+        r = _DummyRow()
+        r.bot = name
+        r.com = u''
+        r.code = u''
+        rows.append(r)
+    rows.sort(key=_species_row_sort_key)
+    assert [r.bot for r in rows] == ['Acaena inermis', 'Carex testacea', 'Poa cita']
 
 
 # ---- Spacing conversions ----
@@ -1552,6 +1583,22 @@ class SpeciesRow(object):
         self.approx_col_def = None
 
 
+
+def _species_row_sort_key(row):
+    botanical = _to_unicode(getattr(row, 'bot', u'')).strip().lower()
+    common = _to_unicode(getattr(row, 'com', u'')).strip().lower()
+    code = _to_unicode(getattr(row, 'code', u'')).strip().lower()
+    primary = botanical or common or code
+    is_blank = 1 if not primary else 0
+    return (is_blank, primary, common, code)
+
+
+def _sort_mix_rows_alphabetically(mix):
+    mix.rows.sort(key=_species_row_sort_key)
+    for idx, row in enumerate(mix.rows):
+        row.index = idx + 1
+    mix.num_species = len(mix.rows)
+
 class MixModel(object):
     """In-memory representation of a single mix schedule annotation instance."""
     def __init__(self, element):
@@ -1616,7 +1663,7 @@ class MixModel(object):
             grade     = get_param(self.element, grade_name)
             groundcover_raw = get_param(self.element, groundcover_name)
 
-            pct_display = pct_raw_to_display(pct_raw)
+            pct_display = pct_family_raw_to_display(pct_raw)
             space_display = space_raw_to_display(space_raw)
 
             self.rows.append(
@@ -1625,6 +1672,7 @@ class MixModel(object):
                     _coerce_yes_no_to_bool(groundcover_raw, default=True)
                 )
             )
+        _sort_mix_rows_alphabetically(self)
 
     def remove_row_at(self, index):
         if index < 0 or index >= len(self.rows):
@@ -3439,7 +3487,7 @@ class MixWindowController(object):
                 self._update_mix_percent_summary(mix)
                 self._update_approx_numbers_for_mix(mix)
             return
-        display = pct_raw_to_display(raw, assume_internal_decimal=True)
+        display = pct_family_raw_to_display(raw)
         if 0 <= row_index < len(mix.rows):
             mix.rows[row_index].pct = display
         if display != text:
@@ -3705,7 +3753,7 @@ class MixWindowController(object):
             # otherwise use the standard new-plant default of 10%.
             if percent not in (None, u'', ''):
                 try:
-                    row.pct = pct_raw_to_display(percent)
+                    row.pct = pct_raw_to_display(percent, assume_internal_decimal=False)
                 except Exception:
                     row.pct = _to_unicode(percent)
             else:
@@ -3717,7 +3765,8 @@ class MixWindowController(object):
             else:
                 row.grade = u''
 
-        # 4. Rebuild the UI and refresh the header percent summary
+        # 4. Sort, rebuild the UI and refresh the header percent summary
+        _sort_mix_rows_alphabetically(mix)
         self._render_mix_body(mix)
         self._update_mix_percent_summary(mix)
         self._update_approx_numbers_for_mix(mix)
@@ -3992,6 +4041,7 @@ class MixWindowController(object):
         try:
             t.Start()
             for mix in self.mixes:
+                _sort_mix_rows_alphabetically(mix)
                 num = len(mix.rows)
                 if num > MAX_SPECIES:
                     num = MAX_SPECIES
@@ -4013,7 +4063,7 @@ class MixWindowController(object):
 
                         code_val = row.code or u''
 
-                        pct_raw = pct_display_to_raw(row.pct)
+                        pct_raw = pct_user_display_to_family_raw(row.pct)
                         pct_val = pct_raw if pct_raw not in (None, u'') else u''
 
                         space_raw_mm = space_display_to_raw(row.spacing)
