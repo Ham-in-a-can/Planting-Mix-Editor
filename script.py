@@ -520,6 +520,19 @@ PLANT_USAGE_LOG_MIX_COLUMNS = [
     'applied_to_revit', 'session_id'
 ]
 
+MIX_USAGE_LOG_EXCLUDED_MIX_NAMES = [
+    u'Placeholder Mix',
+]
+
+
+def _is_excluded_mix_for_usage_log(mix_name):
+    name = _to_unicode(mix_name).strip().lower()
+    for excluded in MIX_USAGE_LOG_EXCLUDED_MIX_NAMES:
+        if name == _to_unicode(excluded).strip().lower():
+            return True
+    return False
+
+
 
 def _csv_cell(value):
     text = _to_unicode(value)
@@ -632,6 +645,10 @@ def _build_mix_usage_rows(doc, mixes, target_view, session_id):
 
     rows = []
     for mix in mixes:
+        mix_name = getattr(mix, 'mix_name', u'') or u''
+        if _is_excluded_mix_for_usage_log(mix_name):
+            LOGGER.info('MIX LOGS: skipping excluded mix "{0}".'.format(mix_name))
+            continue
         species = [r for r in mix.rows if (r.code or r.bot or r.com)]
         species_count = len(species)
         if species_count <= 0:
