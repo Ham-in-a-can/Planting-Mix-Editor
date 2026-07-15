@@ -29,8 +29,8 @@ import math
 from System.Collections.Generic import List
 
 from pyrevit import revit, DB, script
-from Autodesk.Revit.UI import TaskDialog
-from Autodesk.Revit.UI.Selection import ObjectSnapTypes
+from Autodesk.Revit.UI import TaskDialog, TaskDialogCommonButtons, TaskDialogResult
+from Autodesk.Revit.UI.Selection import ObjectSnapTypes, ObjectType, ISelectionFilter
 
 logger = script.get_logger()
 
@@ -54,20 +54,191 @@ MIX_BOUNDARY_STYLE_NAME = "BM Mix Boundary"
 
 # ----------------- General helpers -------------------------------
 
-def get_any_3d_view(doc):
-    """Return any non-template 3D view, or None if not found."""
-    views = DB.FilteredElementCollector(doc).OfClass(DB.View3D).ToElements()
+class FloorContext(object):
+    def __init__(self, floor, source_doc, host_doc, link_instance, transform, hit_point):
+        self.floor = floor
+        self.source_doc = source_doc
+        self.host_doc = host_doc
+        self.link_instance = link_instance
+        self.transform = transform or DB.Transform.Identity
+        try:
+            self.inverse_transform = self.transform.Inverse
+        except Exception:
+            self.inverse_transform = DB.Transform.Identity
+        self.hit_point = hit_point
+        self.is_linked = link_instance is not None
+
+
+def _get_element_id_int(eid):
+    if eid is None:
+        return None
+    try:
+        return eid.IntegerValue
+    except Exception:
+        pass
+    try:
+        return eid.Value
+    except Exception:
+        pass
+    try:
+        return int(eid)
+    except Exception:
+        return None
+
+
+def _view_category_hidden(view, bic):
+    try:
+        return view.GetCategoryHidden(DB.ElementId(bic))
+    except Exception:
+        return False
+
+
+def _is_section_box_active(view):
+    try:
+        return bool(view.IsSectionBoxActive)
+    except Exception:
+        return False
+
+
+def get_best_3d_view_for_raycast(doc):
+    """Prefer a non-template 3D view without section box and with floors/links visible."""
+    views = []
+    try:
+        views = list(DB.FilteredElementCollector(doc).OfClass(DB.View3D).ToElements())
+    except Exception:
+        views = []
+    candidates = []
     for v in views:
-        if not v.IsTemplate:
-            return v
-    return None
+        try:
+            if v.IsTemplate:
+                continue
+        except Exception:
+            continue
+        section = _is_section_box_active(v)
+        floor_hidden = _view_category_hidden(v, DB.BuiltInCategory.OST_Floors)
+        links_hidden = _view_category_hidden(v, DB.BuiltInCategory.OST_RvtLinks)
+        score = 0
+        if section:
+            score += 10
+        if floor_hidden:
+            score += 5
+        if links_hidden:
+            score += 3
+        candidates.append((score, v, section, floor_hidden, links_hidden))
+    if not candidates:
+        logger.error("No non-template 3D view found for floor raycast.")
+        return None
+    candidates.sort(key=lambda item: item[0])
+    chosen = candidates[0]
+    logger.info("Floor raycast 3D view: %s; section_box=%s; floors_hidden=%s; links_hidden=%s",
+                chosen[1].Name, chosen[2], chosen[3], chosen[4])
+    return chosen[1]
+
+
+def _count_host_floors(doc):
+    try:
+        return DB.FilteredElementCollector(doc).OfClass(DB.Floor).WhereElementIsNotElementType().GetElementCount()
+    except Exception:
+        return 0
+
+
+def _loaded_revit_links(doc):
+    links = []
+    try:
+        for link in DB.FilteredElementCollector(doc).OfClass(DB.RevitLinkInstance):
+            try:
+                if link.GetLinkDocument() is not None:
+                    links.append(link)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return links
+
+
+def _max_z_from_bbox(bbox, current):
+    if bbox is None:
+        return current
+    try:
+        if bbox.Max.Z > current:
+            return bbox.Max.Z
+    except Exception:
+        pass
+    return current
+
+
+def _raycast_start_z(doc, pickpoint):
+    max_z = pickpoint.Z + 50.0
+    try:
+        for floor in DB.FilteredElementCollector(doc).OfClass(DB.Floor).WhereElementIsNotElementType():
+            max_z = _max_z_from_bbox(floor.get_BoundingBox(None), max_z)
+    except Exception:
+        pass
+    for link in _loaded_revit_links(doc):
+        max_z = _max_z_from_bbox(link.get_BoundingBox(None), max_z)
+    start_z = max(max_z + 50.0, pickpoint.Z + 50.0)
+    # Keep the ray high enough for tall projects without using extreme values.
+    if start_z > pickpoint.Z + 100000.0:
+        start_z = pickpoint.Z + 100000.0
+    return start_z
+
+
+def _resolve_floor_reference(doc, ref):
+    if ref is None:
+        return None, 'missing reference'
+    elem = None
+    try:
+        elem = doc.GetElement(ref.ElementId)
+    except Exception:
+        elem = None
+    if isinstance(elem, DB.Floor):
+        try:
+            hit = ref.GlobalPoint
+        except Exception:
+            hit = None
+        return FloorContext(elem, doc, doc, None, DB.Transform.Identity, hit), None
+    if isinstance(elem, DB.RevitLinkInstance):
+        link_doc = None
+        try:
+            link_doc = elem.GetLinkDocument()
+        except Exception:
+            link_doc = None
+        if link_doc is None:
+            return None, 'linked document is not loaded'
+        linked_id = None
+        try:
+            linked_id = ref.LinkedElementId
+        except Exception:
+            linked_id = None
+        linked_floor = None
+        if linked_id is not None and _get_element_id_int(linked_id) not in (None, -1):
+            try:
+                linked_floor = link_doc.GetElement(linked_id)
+            except Exception:
+                linked_floor = None
+        if not isinstance(linked_floor, DB.Floor):
+            return None, 'linked reference is not a Floor'
+        try:
+            trf = elem.GetTotalTransform()
+        except Exception:
+            trf = elem.GetTransform()
+        try:
+            hit = ref.GlobalPoint
+        except Exception:
+            hit = None
+        return FloorContext(linked_floor, link_doc, doc, elem, trf, hit), None
+    return None, 'reference element is not a Floor or RevitLinkInstance'
 
 
 def get_floor_below_point(doc, pickpoint):
-    """Use a vertical raycast to find the nearest Floor below the picked point."""
-    view3d = get_any_3d_view(doc)
+    """Use a vertical raycast to find nearest host or linked Floor below the point."""
+    diagnostics = []
+    view3d = get_best_3d_view_for_raycast(doc)
+    host_count = _count_host_floors(doc)
+    links = _loaded_revit_links(doc)
+    logger.info("Floor raycast picked XYZ=(%.3f, %.3f, %.3f); active host floors=%s; loaded links=%s",
+                pickpoint.X, pickpoint.Y, pickpoint.Z, host_count, len(links))
     if not view3d:
-        logger.error("No 3D view found for raycasting.")
         return None
 
     floor_filter = DB.ElementClassFilter(DB.Floor)
@@ -76,18 +247,59 @@ def get_floor_below_point(doc, pickpoint):
         DB.FindReferenceTarget.Element,
         view3d
     )
+    linked_enabled = False
+    try:
+        ref_intersector.FindReferencesInRevitLinks = True
+        linked_enabled = True
+    except Exception:
+        linked_enabled = False
+    logger.info("Floor raycast linked searching enabled=%s", linked_enabled)
 
-    origin = pickpoint + DB.XYZ(0, 0, 10.0)
+    origin = DB.XYZ(pickpoint.X, pickpoint.Y, _raycast_start_z(doc, pickpoint))
     direction = DB.XYZ(0, 0, -1.0)
 
-    result = ref_intersector.FindNearest(origin, direction)
-    if result is None:
-        logger.warning("No floor found below picked point.")
-        return None
+    try:
+        results = list(ref_intersector.Find(origin, direction))
+    except Exception as ex:
+        logger.warning("Floor raycast failed: %s", ex)
+        results = []
+    logger.info("Floor raycast hits considered=%s", len(results))
 
-    ref = result.GetReference()
-    floor = doc.GetElement(ref.ElementId)
-    return floor
+    best = None
+    best_z = None
+    for result in results:
+        try:
+            ref = result.GetReference()
+        except Exception:
+            diagnostics.append('hit without reference')
+            continue
+        ctx, reason = _resolve_floor_reference(doc, ref)
+        if ctx is None:
+            diagnostics.append(reason)
+            continue
+        try:
+            hit = ref.GlobalPoint
+        except Exception:
+            hit = ctx.hit_point
+        if hit is None:
+            diagnostics.append('hit had no global point')
+            continue
+        if hit.Z > origin.Z + 1e-6:
+            diagnostics.append('hit above ray origin')
+            continue
+        if best is None or hit.Z > best_z:
+            ctx.hit_point = hit
+            best = ctx
+            best_z = hit.Z
+    if best is not None:
+        logger.info("Floor raycast selected %s floor id=%s hit_z=%.3f",
+                    'linked' if best.is_linked else 'host', _get_element_id_int(best.floor.Id), best_z)
+        return best
+
+    for reason in diagnostics[:20]:
+        logger.info("Floor raycast rejected hit: %s", reason)
+    logger.warning("No floor found below picked point after considering %s hits.", len(results))
+    return None
 
 
 def get_top_planar_face(floor):
@@ -588,22 +800,62 @@ def draw_tree_trunks(doc, view, outer_loop, target_z, sketch_plane, boundary_sty
     logger.info("Created %s area-boundary arcs for tree trunks.", created)
 
 
+
+def _curve_loop_to_host_and_view_z(curve_loop, transform, target_z):
+    host_loop = DB.CurveLoop()
+    for crv in curve_loop:
+        try:
+            host_curve = crv.CreateTransformed(transform)
+        except Exception:
+            host_curve = crv
+        host_loop.Append(flatten_curve_to_view_z(host_curve, target_z))
+    return host_loop
+
+
+def _floor_context_from_host_floor(doc, floor):
+    return FloorContext(floor, doc, doc, None, DB.Transform.Identity, None)
+
 # --------------- Main area boundary creation ---------------------
 
-def create_area_boundaries_from_floor(doc, view, floor):
+def create_area_boundaries_from_floor(doc, view, floor_context):
     """Create area boundary lines based on presence/absence of planting, plus tree trunks."""
 
+    if isinstance(floor_context, DB.Floor):
+        floor_context = _floor_context_from_host_floor(doc, floor_context)
+
+    floor = floor_context.floor
     top_face = get_top_planar_face(floor)
     if top_face is None:
         TaskDialog.Show("Area Boundary From Floor",
                         "Could not find a horizontal top face for the selected floor.")
         return False
 
-    loops = top_face.GetEdgesAsCurveLoops()
-    if loops is None or loops.Count == 0:
+    raw_loops = top_face.GetEdgesAsCurveLoops()
+    if raw_loops is None or raw_loops.Count == 0:
         TaskDialog.Show("Area Boundary From Floor",
                         "Could not get perimeter loops for the selected floor.")
         return False
+
+    # Ensure the host Area Plan has a sketch plane; all new boundaries are host elements.
+    sketch_plane = view.SketchPlane
+    if sketch_plane is None:
+        gen_level = view.GenLevel
+        if gen_level:
+            z = gen_level.Elevation
+        else:
+            z = 0.0
+        plane = DB.Plane.CreateByNormalAndOrigin(DB.XYZ.BasisZ, DB.XYZ(0.0, 0.0, z))
+        sketch_plane = DB.SketchPlane.Create(doc, plane)
+        view.SketchPlane = sketch_plane
+
+    if view.GenLevel:
+        target_z = view.GenLevel.Elevation
+    else:
+        target_z = sketch_plane.GetPlane().Origin.Z
+
+    loops = []
+    for raw_loop in raw_loops:
+        loops.append(_curve_loop_to_host_and_view_z(raw_loop, floor_context.transform, target_z))
 
     # Choose outer loop as polygon – the one with greatest length
     outer_loop = None
@@ -641,23 +893,6 @@ def create_area_boundaries_from_floor(doc, view, floor):
     reg_maxx = maxx
     reg_miny = miny
     reg_maxy = maxy
-
-    # Ensure the view has a sketch plane
-    sketch_plane = view.SketchPlane
-    if sketch_plane is None:
-        gen_level = view.GenLevel
-        if gen_level:
-            z = gen_level.Elevation
-        else:
-            z = 0.0
-        plane = DB.Plane.CreateByNormalAndOrigin(DB.XYZ.BasisZ, DB.XYZ(0.0, 0.0, z))
-        sketch_plane = DB.SketchPlane.Create(doc, plane)
-        view.SketchPlane = sketch_plane
-
-    if view.GenLevel:
-        target_z = view.GenLevel.Elevation
-    else:
-        target_z = sketch_plane.GetPlane().Origin.Z
 
     # Get or create dedicated mix boundary line style
     boundary_style = get_mix_boundary_linestyle(doc)
@@ -709,6 +944,51 @@ def create_area_boundaries_from_floor(doc, view, floor):
     return True
 
 
+
+class FloorPickFilter(ISelectionFilter):
+    def AllowElement(self, elem):
+        if isinstance(elem, DB.Floor):
+            return True
+        if isinstance(elem, DB.RevitLinkInstance):
+            return True
+        return False
+
+    def AllowReference(self, reference, point):
+        return True
+
+
+def _manual_select_floor_context(uidoc, doc):
+    logger.info("Floor manual selection attempted.")
+    try:
+        ref = uidoc.Selection.PickObject(ObjectType.Element, FloorPickFilter(), "Select a host floor, or select a Revit link and then use linked-floor selection if needed.")
+        elem = doc.GetElement(ref.ElementId)
+        if isinstance(elem, DB.Floor):
+            return FloorContext(elem, doc, doc, None, DB.Transform.Identity, None)
+        if isinstance(elem, DB.RevitLinkInstance):
+            # Ask for a linked element selection when the user picked the link instance itself.
+            ref = uidoc.Selection.PickObject(ObjectType.LinkedElement, FloorPickFilter(), "Select the floor inside the Revit link.")
+    except Exception:
+        return None
+    ctx, reason = _resolve_floor_reference(doc, ref)
+    if ctx is None:
+        logger.warning("Manual floor selection rejected: %s", reason)
+    return ctx
+
+
+def _ask_manual_floor_selection(uidoc, doc):
+    td = TaskDialog("Area Boundary From Floor")
+    td.MainInstruction = "No floor was found automatically below the picked point."
+    td.MainContent = "Select a host or linked floor manually, or cancel."
+    td.CommonButtons = TaskDialogCommonButtons.Yes | TaskDialogCommonButtons.No
+    td.DefaultButton = TaskDialogResult.Yes
+    try:
+        result = td.Show()
+    except Exception:
+        return None
+    if result != TaskDialogResult.Yes:
+        return None
+    return _manual_select_floor_context(uidoc, doc)
+
 # ---------------------------- Entry ------------------------------
 
 def main(mix_name=None):
@@ -722,24 +1002,31 @@ def main(mix_name=None):
         return
 
     try:
+        logger.info("Floor pick active view: %s (%s)", view.Name, view.ViewType)
+    except Exception:
+        pass
+
+    try:
         pick = uidoc.Selection.PickPoint(
-            ObjectSnapTypes.None,
+            getattr(ObjectSnapTypes, 'None'),
             "Pick a point to find the floor below and place the Area."
         )
     except Exception:
         # User cancelled
         return
 
-    floor = get_floor_below_point(doc, pick)
-    if floor is None:
+    floor_context = get_floor_below_point(doc, pick)
+    if floor_context is None:
+        floor_context = _ask_manual_floor_selection(uidoc, doc)
+    if floor_context is None:
         TaskDialog.Show("Area Boundary From Floor",
-                        "No floor was found below the picked point.")
+                        "No floor was selected. Area boundary creation was cancelled.")
         return
 
     t = DB.Transaction(doc, "Create / Update Area Boundaries and Area")
     t.Start()
     try:
-        success = create_area_boundaries_from_floor(doc, view, floor)
+        success = create_area_boundaries_from_floor(doc, view, floor_context)
 
         # Place an Area at the picked point and set Name if mix_name is given
         try:

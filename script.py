@@ -3305,20 +3305,26 @@ class MixWindowController(object):
             uiapp = None
         view = doc.ActiveView
 
-        # Bind callback dependencies as default arguments. pyRevit can tear
-        # down this command module's globals before DrawArea.py receives the
-        # later Idling callback, so reopening must load a fresh copy of this
-        # script module instead of reusing the old MixWindowController class
-        # whose methods depend on globals such as DB, forms, and XamlReader.
-        def _close_editor(window=self.window):
+        # Bind stable callbacks for DrawArea.py. Reopen through one stable
+        # module name to avoid accumulating a new script.py module on every
+        # Draw Area run.
+        close_state = {'closed': False}
+
+        def _close_editor(window=self.window, state=close_state):
+            if state.get('closed'):
+                return
+            state['closed'] = True
             try:
                 if window is not None:
                     window.Close()
             except Exception:
                 pass
 
-        def _reopen_editor(reopen_doc, script_path=os.path.join(SCRIPT_DIR, 'script.py'), loader=imp.load_source):
-            reopened = loader('mix_schedule_editor_reopen', script_path)
+        def _reopen_editor(reopen_doc, script_path=os.path.join(SCRIPT_DIR, 'script.py')):
+            module_name = 'mix_schedule_editor_reopen'
+            reopened = sys.modules.get(module_name)
+            if reopened is None or not hasattr(reopened, 'open_mix_editor'):
+                reopened = imp.load_source(module_name, script_path)
             reopened.open_mix_editor(reopen_doc)
 
         try:

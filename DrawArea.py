@@ -7,7 +7,7 @@ API context returns, so DocumentChanged only records newly added boundary line
 ids and Idling performs all model modifications once Revit returns to idle.
 """
 
-from pyrevit import DB, forms
+from pyrevit import DB, forms, script
 from Autodesk.Revit.UI import RevitCommandId, PostableCommand
 
 try:
@@ -26,10 +26,13 @@ _DRAW_AREA_EVENTS_SUBSCRIBED = False
 _DRAW_AREA_DOC_CHANGED_HANDLER = None
 _DRAW_AREA_IDLING_HANDLER = None
 _DRAW_AREA_EVENTS_UIAPP = None
-DRAW_AREA_MAX_IDLE_WITHOUT_LINES = 25
-DRAW_AREA_MAX_IDLE_WITH_LINES = 1
+DRAW_AREA_PHASE_WAITING_TO_POST = u'waiting_to_post'
+DRAW_AREA_PHASE_NATIVE_ACTIVE = u'native_command_active'
+DRAW_AREA_PHASE_PROCESSING = u'processing'
+DRAW_AREA_PHASE_COMPLETE = u'complete'
 MIX_BOUNDARY_STYLE_NAME = u'BM Mix Boundary'
 AREA_NAME_PARAM = u'Name'
+LOGGER = script.get_logger()
 
 
 def _to_unicode(value):
@@ -463,11 +466,13 @@ class DrawAreaSession(object):
         self.reopen_callback = reopen_callback
         self.set_area_name_callback = set_area_name_callback
         self.added_ids = set()
-        self.idle_attempts = 0
-        self.idle_with_lines = 0
         self.doc_changed_handler = None
         self.idling_handler = None
         self.completed = False
+        self.phase = DRAW_AREA_PHASE_WAITING_TO_POST
+        self.idling_sequence = 0
+        self.posted_idling_sequence = None
+        self.command_posted = False
 
 
 def _ensure_draw_area_events(uiapp):
@@ -541,6 +546,7 @@ def _draw_area_finish(session, reopen=True):
         return
     _draw_area_unsubscribe(session)
     session.completed = True
+    session.phase = DRAW_AREA_PHASE_COMPLETE
     if _DRAW_AREA_SESSION is session:
         _DRAW_AREA_SESSION = None
     if reopen:
@@ -587,6 +593,7 @@ def _draw_area_apply_results(session, progress_bar=None):
         current = _collect_area_boundary_ids_in_view(doc, session.view_id)
         ids = current.difference(session.existing_ids)
     if not ids:
+        LOGGER.info('DRAW AREA: native command completed/cancelled with no new boundary lines.')
         return
 
     loops = _build_closed_loops_from_boundary_ids(doc, ids)
@@ -621,6 +628,7 @@ def _draw_area_apply_results(session, progress_bar=None):
             except Exception:
                 pass
 
+        LOGGER.info('DRAW AREA: Area placed count={0}.'.format(placed_count))
         if placed_count <= 0:
             forms.alert(u'Area Boundary lines were drawn and styled, but Revit did not find an enclosed '
                         u'Area at the sampled points. The lines were left in place; if they connect to '
@@ -659,6 +667,7 @@ def _draw_area_apply_results(session, progress_bar=None):
             _progress_update(progress_bar, 3 + loop_index, total_steps)
 
         t.Commit()
+        LOGGER.info('DRAW AREA: Area placed count={0}; failed loops={1}.'.format(placed_count, failed_loops))
         _progress_update(progress_bar, total_steps, total_steps)
     except Exception as ex:
         try:
@@ -681,30 +690,8 @@ def _draw_area_apply_results(session, progress_bar=None):
                     title='Draw Area')
 
 
-def _draw_area_idling(sender, args):
-    """Process recorded ids after Revit returns to idle from the posted command."""
-    # Once Revit gives us an Idling callback, ask it to keep raising Idling
-    # without waiting for extra user input. This cannot force the first idle
-    # after the native command, but it avoids an additional click/key press once
-    # Revit has yielded back to the API.
-    try:
-        args.SetRaiseWithoutDelay()
-    except Exception:
-        pass
-
-    session = _DRAW_AREA_SESSION
-    if session is None or session.completed:
-        return
-
-    if session.added_ids:
-        session.idle_with_lines += 1
-        if session.idle_with_lines < DRAW_AREA_MAX_IDLE_WITH_LINES:
-            return
-    else:
-        session.idle_attempts += 1
-        if session.idle_attempts < DRAW_AREA_MAX_IDLE_WITHOUT_LINES:
-            return
-
+def _draw_area_process_and_finish(session):
+    LOGGER.info('DRAW AREA: native command completed or cancelled; processing started.')
     try:
         progress_ctx = None
         try:
@@ -716,18 +703,74 @@ def _draw_area_idling(sender, args):
             progress_ctx = None
 
         if progress_ctx is None:
-            # If the pyRevit progress UI is unavailable for any reason, still
-            # complete the Revit work and reopen the editor.
             _draw_area_apply_results(session, None)
         else:
             with progress_ctx as progress_bar:
                 _draw_area_apply_results(session, progress_bar)
     finally:
+        LOGGER.info('DRAW AREA: editor reopen requested.')
         _draw_area_finish(session, reopen=True)
 
 
+def _draw_area_post_native_command(session):
+    try:
+        cmd_id = RevitCommandId.LookupPostableCommandId(PostableCommand.AreaBoundary)
+        if cmd_id is None:
+            raise Exception('Area Boundary command id was not found.')
+        try:
+            if hasattr(session.uiapp, 'CanPostCommand') and not session.uiapp.CanPostCommand(cmd_id):
+                raise Exception('Revit cannot post the Area Boundary command right now.')
+        except Exception as can_ex:
+            # CanPostCommand is not available/consistent in every supported version;
+            # only treat explicit failures from the call above as fatal.
+            if 'cannot post' in _to_unicode(can_ex).lower():
+                raise
+        session.uiapp.PostCommand(cmd_id)
+        session.command_posted = True
+        session.posted_idling_sequence = session.idling_sequence
+        session.phase = DRAW_AREA_PHASE_NATIVE_ACTIVE
+        LOGGER.info('DRAW AREA: Area Boundary command posted.')
+        return True
+    except Exception as ex:
+        _draw_area_finish(session, reopen=False)
+        forms.alert(u'Could not start Revit Area Boundary drawing command:\n{0}'.format(_exception_message(ex)),
+                    title='Draw Area')
+        LOGGER.info('DRAW AREA: editor reopen requested after PostCommand failure.')
+        _draw_area_reopen_editor(session)
+        return False
+
+
+def _draw_area_idling(sender, args):
+    """Advance Draw Area through post, native command return, and processing."""
+    session = _DRAW_AREA_SESSION
+    if session is None or session.completed:
+        return
+
+    session.idling_sequence += 1
+
+    if session.phase == DRAW_AREA_PHASE_WAITING_TO_POST:
+        LOGGER.info('DRAW AREA: waiting_to_post; posting native Area Boundary command.')
+        _draw_area_post_native_command(session)
+        return
+
+    if session.phase == DRAW_AREA_PHASE_NATIVE_ACTIVE:
+        if session.posted_idling_sequence is not None and session.idling_sequence <= session.posted_idling_sequence:
+            return
+        session.phase = DRAW_AREA_PHASE_PROCESSING
+        new_count = len(session.added_ids)
+        if new_count <= 0:
+            try:
+                current = _collect_area_boundary_ids_in_view(session.doc, session.view_id)
+                new_count = len(current.difference(session.existing_ids))
+            except Exception:
+                new_count = 0
+        LOGGER.info('DRAW AREA: number of new boundary lines detected: {0}'.format(new_count))
+        _draw_area_process_and_finish(session)
+        return
+
+
 def start_draw_area_session(doc, uidoc, uiapp, view, mix_name, close_callback, reopen_callback, set_area_name_callback=None):
-    """Validate, subscribe event handlers, close editor, and post Area Boundary."""
+    """Validate, subscribe handlers, close editor, and let Idling post Area Boundary."""
     global _DRAW_AREA_SESSION
 
     mix_name = _to_unicode(mix_name).strip()
@@ -765,26 +808,12 @@ def start_draw_area_session(doc, uidoc, uiapp, view, mix_name, close_callback, r
 
     try:
         if close_callback is not None:
+            LOGGER.info('DRAW AREA: editor close requested.')
             close_callback()
     except Exception:
+        # The editor may already be closing; continue so Revit can start drawing.
         pass
 
-    # Only mark the session active after the editor has been asked to close.
-    # The persistent Idling handler may run while the modal editor is still
-    # unwinding; keeping the session inactive until now prevents it from
-    # processing before the native Area Boundary command is posted.
     _DRAW_AREA_SESSION = session
-
-    try:
-        cmd_id = RevitCommandId.LookupPostableCommandId(PostableCommand.AreaBoundary)
-        if cmd_id is None:
-            raise Exception('Area Boundary command id was not found.')
-        uiapp.PostCommand(cmd_id)
-    except Exception as ex:
-        _draw_area_finish(session, reopen=False)
-        forms.alert(u'Could not start Revit Area Boundary drawing command:\n{0}'.format(_exception_message(ex)),
-                    title='Draw Area')
-        _draw_area_reopen_editor(session)
-        return False
-
+    LOGGER.info('DRAW AREA: session created; waiting to post Area Boundary command.')
     return True
