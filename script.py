@@ -141,6 +141,10 @@ FILLED_REGION_HEIGHT_MM = 4.0
 DEBUG_FILLED_REGION = False
 
 
+# Path to plant library script
+CREATE_PLANT_SCRIPT_PATH = r"C:\Users\hamishc\OneDrive - Boffa Miskell\Desktop\Shared_Dynamo\ToolBar\OnServer\BoffaTestTools.extension\BoffaTools.tab\Test.panel\Create Plant.pushbutton\script.py"
+
+
 # Path to XAML file (placed next to this script)
 try:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -161,7 +165,7 @@ def _normalise_path_basic(path):
         return os.path.normpath(path)
 
 
-def _find_shared_config_root(start_dir, filename='bm_shared_paths.py'):
+def _find_bm_shared_paths_root(start_dir, filename='bm_shared_paths.py'):
     current = _normalise_path_basic(start_dir)
     for index in range(12):
         candidate = os.path.join(current, filename)
@@ -174,16 +178,17 @@ def _find_shared_config_root(start_dir, filename='bm_shared_paths.py'):
     return None
 
 
-SHARED_CONFIG_ROOT = _find_shared_config_root(SCRIPT_DIR)
-if SHARED_CONFIG_ROOT and SHARED_CONFIG_ROOT not in sys.path:
-    sys.path.insert(0, SHARED_CONFIG_ROOT)
+MASSED_EDITOR_SCRIPT_DIR = SCRIPT_DIR
+BM_SHARED_PATHS_ROOT = _find_bm_shared_paths_root(MASSED_EDITOR_SCRIPT_DIR)
+if BM_SHARED_PATHS_ROOT and BM_SHARED_PATHS_ROOT not in sys.path:
+    sys.path.insert(0, BM_SHARED_PATHS_ROOT)
 
 try:
     import bm_shared_paths
-    SHARED_PATH_IMPORT_ERROR = None
+    BM_SHARED_PATHS_IMPORT_ERROR = None
 except Exception as ex:
     bm_shared_paths = None
-    SHARED_PATH_IMPORT_ERROR = ex
+    BM_SHARED_PATHS_IMPORT_ERROR = ex
 
 
 def _shared_normalise(path):
@@ -195,31 +200,39 @@ def _shared_normalise(path):
     return _normalise_path_basic(path) if path else u''
 
 
-def _resolve_extension_root():
-    if bm_shared_paths is not None:
-        try:
-            root = bm_shared_paths.get_extension_root()
-            if root:
-                return _shared_normalise(root)
-        except Exception:
-            pass
-    return _shared_normalise(SHARED_CONFIG_ROOT)
-
-
-EXTENSION_ROOT = _resolve_extension_root()
-
-
-def _resolve_shared_usage_log_path():
+def _resolve_massed_editor_usage_log_path():
     if bm_shared_paths is None:
         return u''
+    path = u''
     try:
-        path = bm_shared_paths.get_tool_path('massed_planting_editor', 'usage_log_csv', '')
+        path = bm_shared_paths.get_tool_path('plant_library', 'usage_log_csv', '')
     except Exception:
         path = u''
+    if not path:
+        try:
+            path = bm_shared_paths.PLANT_LIBRARY_USAGE_LOG_CSV
+        except Exception:
+            path = u''
+    if not path:
+        return u''
     return _shared_normalise(path)
 
 
-MASSED_USAGE_LOG_PATH = _resolve_shared_usage_log_path()
+MASSED_EDITOR_USAGE_LOG_PATH = _resolve_massed_editor_usage_log_path()
+
+try:
+    _bm_shared_paths_file = os.path.join(BM_SHARED_PATHS_ROOT, 'bm_shared_paths.py') if BM_SHARED_PATHS_ROOT else u'(unresolved)'
+    LOGGER.info('MASSED PLANTING USAGE: bm_shared_paths.py = {0}'.format(_bm_shared_paths_file))
+    LOGGER.info('MASSED PLANTING USAGE: usage_log_csv = {0}'.format(MASSED_EDITOR_USAGE_LOG_PATH or u'(unresolved)'))
+    LOGGER.info('MASSED PLANTING USAGE: Plant Library script = {0}'.format(CREATE_PLANT_SCRIPT_PATH))
+    if bm_shared_paths is None or not MASSED_EDITOR_USAGE_LOG_PATH:
+        LOGGER.warning(
+            'MASSED PLANTING USAGE: Shared usage-log path could not be resolved from '
+            'bm_shared_paths.py. Usage logging will be skipped; planting mix operations are not affected.'
+        )
+except Exception:
+    # Diagnostics must never prevent the editor from loading.
+    pass
 
 XAML_FILE = os.path.join(SCRIPT_DIR, 'mix_schedules.xaml')
 DUPLICATE_ICON_PATH = os.path.join(SCRIPT_DIR, DUPLICATE_ICON_NAME)
@@ -403,256 +416,6 @@ def _hash_log_value(value):
         return u''
 
 
-
-def _find_extension_root(start_dir):
-    """Walk upward from start_dir to find the containing .extension folder."""
-    root = _normalise_path_basic(start_dir)
-    while root:
-        if root.lower().endswith('.extension'):
-            return root
-        parent = os.path.dirname(root)
-        if not parent or parent == root:
-            break
-        root = parent
-    return None
-
-
-def _path_key(path):
-    return _shared_normalise(path).rstrip('\\/').lower()
-
-
-def _path_is_within(candidate, parent):
-    candidate_key = _path_key(candidate)
-    parent_key = _path_key(parent)
-    if not candidate_key or not parent_key:
-        return False
-    return candidate_key == parent_key or candidate_key.startswith(parent_key + os.sep.lower())
-
-
-def _find_nearest_panel_dir(start_dir):
-    current = _normalise_path_basic(start_dir)
-    while current:
-        if os.path.basename(current).lower().endswith('.panel'):
-            return current
-        parent = os.path.dirname(current)
-        if not parent or parent == current:
-            break
-        current = parent
-    return None
-
-
-def _is_plant_library_button_dir(folder):
-    name = os.path.basename(folder).lower()
-    if not name.endswith('.pushbutton'):
-        return False
-    return ('create plant' in name) or ('plant library' in name)
-
-
-def _candidate_plant_library_script(folder):
-    if not _is_plant_library_button_dir(folder):
-        return u''
-    candidate = os.path.join(folder, 'script.py')
-    if not os.path.isfile(candidate):
-        return u''
-    if _path_key(candidate) == _path_key(os.path.join(SCRIPT_DIR, 'script.py')):
-        return u''
-    if EXTENSION_ROOT and not _path_is_within(candidate, EXTENSION_ROOT):
-        LOGGER.warning('MASS PLANTING PATHS: legacy Plant Library path detected and rejected: {0}'.format(candidate))
-        return u''
-    try:
-        with open(candidate, 'rb') as fh:
-            data = fh.read(300000)
-        if b'open_plant_library_dialog_for_mix' not in data and b'Create Plant' not in data:
-            return u''
-    except Exception:
-        return u''
-    return _shared_normalise(candidate)
-
-
-def _find_current_plant_library_script():
-    attempts = []
-    if not EXTENSION_ROOT:
-        LOGGER.warning('MASS PLANTING PATHS: cannot resolve Plant Library because extension root is unavailable.')
-        return u''
-
-    panel_dir = _find_nearest_panel_dir(SCRIPT_DIR)
-    if panel_dir:
-        for folder_name in ('Create Plant.pushbutton', 'Plant Library.pushbutton'):
-            folder = os.path.join(panel_dir, folder_name)
-            attempts.append(folder)
-            found = _candidate_plant_library_script(folder)
-            if found:
-                LOGGER.info('MASS PLANTING PATHS: Plant Library script = {0}'.format(found))
-                _find_current_plant_library_script.attempts = attempts
-                return found
-
-    try:
-        for dirpath, dirnames, filenames in os.walk(EXTENSION_ROOT):
-            if not _is_plant_library_button_dir(dirpath):
-                continue
-            attempts.append(dirpath)
-            found = _candidate_plant_library_script(dirpath)
-            if found:
-                LOGGER.info('MASS PLANTING PATHS: Plant Library script = {0}'.format(found))
-                _find_current_plant_library_script.attempts = attempts
-                return found
-    except Exception as ex:
-        attempts.append(u'extension search failed: {0}'.format(ex))
-
-    _find_current_plant_library_script.attempts = attempts
-    LOGGER.warning('MASS PLANTING PATHS: current Plant Library script could not be resolved inside {0}.'.format(EXTENSION_ROOT))
-    return u''
-
-
-def _format_create_plant_resolution_attempts():
-    attempts = getattr(_find_current_plant_library_script, 'attempts', [])
-    if not attempts:
-        return u'(no search attempts recorded)'
-    return u'\n'.join([u' - {0}'.format(a) for a in attempts])
-
-
-CURRENT_PLANT_LIBRARY_SCRIPT_PATH = _find_current_plant_library_script()
-
-
-def _resolve_plant_library_usage_path(module):
-    candidates = []
-    for attr in ('USAGE_LOG_PATH', 'usage_log_csv_path'):
-        try:
-            value = getattr(module, attr)
-            if value:
-                candidates.append(value() if callable(value) else value)
-        except Exception:
-            pass
-    for fn_name in ('get_resolved_usage_log_path',):
-        try:
-            fn = getattr(module, fn_name)
-            candidates.append(fn())
-        except Exception:
-            pass
-    try:
-        fn = getattr(module, '_shared_tool_path')
-        candidates.append(fn('usage_log_csv'))
-    except Exception:
-        pass
-    for value in candidates:
-        value = _shared_normalise(value)
-        if value:
-            return value
-    return u''
-
-
-def _log_startup_path_diagnostics():
-    LOGGER.info('MASS PLANTING PATHS: Script directory = {0}'.format(SCRIPT_DIR))
-    if SHARED_CONFIG_ROOT:
-        LOGGER.info('MASS PLANTING PATHS: Extension root = {0}'.format(EXTENSION_ROOT))
-        LOGGER.info('MASS PLANTING PATHS: Shared config = {0}'.format(os.path.join(SHARED_CONFIG_ROOT, 'bm_shared_paths.py')))
-    else:
-        LOGGER.warning('MASS PLANTING PATHS: bm_shared_paths.py could not be found above {0}.'.format(SCRIPT_DIR))
-    if bm_shared_paths is not None:
-        try:
-            if hasattr(bm_shared_paths, 'is_environment_override_active') and bm_shared_paths.is_environment_override_active():
-                LOGGER.info('MASS PLANTING PATHS: BM_PYREVIT_SHARED_DATA_ROOT override is active.')
-        except Exception:
-            pass
-    elif SHARED_PATH_IMPORT_ERROR is not None:
-        LOGGER.warning('MASS PLANTING PATHS: bm_shared_paths.py import failed: {0}'.format(SHARED_PATH_IMPORT_ERROR))
-    LOGGER.info('MASS PLANTING PATHS: Usage log = {0}'.format(MASSED_USAGE_LOG_PATH or '(unresolved)'))
-    LOGGER.info('MASS PLANTING PATHS: Plant Library script = {0}'.format(CURRENT_PLANT_LIBRARY_SCRIPT_PATH or '(unresolved)'))
-    _log_legacy_usage_logs()
-
-
-def _legacy_usage_log_candidates():
-    candidates = [
-        os.path.join(SCRIPT_DIR, 'plant_usage_log.csv'),
-        os.path.join(SCRIPT_DIR, 'logs', 'plant_usage_log.csv'),
-    ]
-    plant_script = CURRENT_PLANT_LIBRARY_SCRIPT_PATH
-    if plant_script:
-        plant_dir = os.path.dirname(plant_script)
-        candidates.append(os.path.join(plant_dir, 'plant_usage_log.csv'))
-        candidates.append(os.path.join(plant_dir, 'logs', 'plant_usage_log.csv'))
-    return candidates
-
-
-def _log_legacy_usage_logs():
-    for candidate in _legacy_usage_log_candidates():
-        try:
-            if candidate and os.path.isfile(candidate) and _path_key(candidate) != _path_key(MASSED_USAGE_LOG_PATH):
-                LOGGER.warning('MASS PLANTING PATHS: legacy usage log detected at {0}. Configured shared log is {1}.'.format(candidate, MASSED_USAGE_LOG_PATH))
-        except Exception:
-            pass
-
-
-def _load_current_plant_library_module():
-    script_path = CURRENT_PLANT_LIBRARY_SCRIPT_PATH
-    if not script_path or not os.path.isfile(script_path):
-        LOGGER.error('MASS PLANTING: current Plant Library script was not found. Attempts:\n{0}'.format(_format_create_plant_resolution_attempts()))
-        return None
-    if EXTENSION_ROOT and not _path_is_within(script_path, EXTENSION_ROOT):
-        LOGGER.error('MASS PLANTING PATHS: legacy Plant Library path detected and rejected: {0}'.format(script_path))
-        return None
-    old_path = list(sys.path)
-    module_name = 'bm_current_plant_library_for_mix'
-    try:
-        plant_dir = os.path.dirname(script_path)
-        if plant_dir in sys.path:
-            sys.path.remove(plant_dir)
-        sys.path.insert(0, plant_dir)
-        if SHARED_CONFIG_ROOT and SHARED_CONFIG_ROOT not in sys.path:
-            sys.path.insert(0, SHARED_CONFIG_ROOT)
-        if module_name in sys.modules:
-            del sys.modules[module_name]
-        module = imp.load_source(module_name, script_path)
-        LOGGER.info('MASS PLANTING PATHS: Plant Library script = {0}'.format(script_path))
-        LOGGER.info('MASS PLANTING PATHS: Shared configuration = {0}'.format(os.path.join(SHARED_CONFIG_ROOT or '', 'bm_shared_paths.py')))
-        LOGGER.info('MASS PLANTING PATHS: Expected usage log = {0}'.format(MASSED_USAGE_LOG_PATH or '(unresolved)'))
-        lib_usage = _resolve_plant_library_usage_path(module)
-        if lib_usage and MASSED_USAGE_LOG_PATH and _path_key(lib_usage) != _path_key(MASSED_USAGE_LOG_PATH):
-            LOGGER.warning('MASS PLANTING PATHS: Plant Library usage-log path mismatch. Expected: {0} Resolved: {1}'.format(MASSED_USAGE_LOG_PATH, lib_usage))
-        return module
-    except Exception as ex:
-        LOGGER.error('MASS PLANTING: failed to load Plant Library from {0}: {1}'.format(script_path, ex))
-        return None
-    finally:
-        try:
-            sys.path[:] = old_path
-        except Exception:
-            pass
-
-
-def _fallback_usage_log_path():
-    local = os.environ.get('LOCALAPPDATA', '')
-    if not local:
-        local = os.path.expanduser('~')
-    return _shared_normalise(os.path.join(local, 'BoffaMiskell', 'pyRevit', 'FallbackLogs', 'PlantLibrary', 'plant_usage_log.csv'))
-
-
-def _get_writable_usage_log_path():
-    path = MASSED_USAGE_LOG_PATH
-    if path:
-        try:
-            folder = os.path.dirname(path)
-            if folder and not os.path.exists(folder):
-                os.makedirs(folder)
-            return path
-        except Exception as ex:
-            LOGGER.warning('MASS PLANTING PATHS: shared usage log unavailable: {0}'.format(ex))
-    fallback = _fallback_usage_log_path()
-    LOGGER.warning('MASS PLANTING PATHS: shared usage log unavailable. Using fallback log: {0}'.format(fallback))
-    try:
-        folder = os.path.dirname(fallback)
-        if folder and not os.path.exists(folder):
-            os.makedirs(folder)
-    except Exception as ex:
-        LOGGER.warning('MASS PLANTING PATHS: fallback usage log unavailable: {0}'.format(ex))
-        return u''
-    return fallback
-
-
-try:
-    _log_startup_path_diagnostics()
-except Exception as _path_diag_ex:
-    LOGGER.warning('MASS PLANTING PATHS: startup diagnostics failed: {0}'.format(_path_diag_ex))
 
 
 def _get_doc_path(doc):
@@ -883,9 +646,12 @@ def _log_mix_usage_diagnostics(path, file_existed_before, existing_header, merge
         LOGGER.warning('MIX LOGS: failed to write diagnostics: {0}'.format(ex))
 
 def _append_mix_usage_log_rows(doc, mixes, target_view, session_id):
-    path = _get_writable_usage_log_path()
+    path = MASSED_EDITOR_USAGE_LOG_PATH
     if not path:
-        LOGGER.warning('MIX LOGS: no writable usage log path is available; skipping analytics rows.')
+        LOGGER.warning(
+            'MASSED PLANTING USAGE: Shared usage-log path could not be resolved from '
+            'bm_shared_paths.py. Usage logging was skipped. The planting mix operation was not affected.'
+        )
         return
     file_existed_before = os.path.exists(path)
     new_rows = _build_mix_usage_rows(doc, mixes, target_view, session_id)
@@ -893,30 +659,22 @@ def _append_mix_usage_log_rows(doc, mixes, target_view, session_id):
         LOGGER.info('MIX LOGS: no non-empty mix species rows found to log.')
         _log_mix_usage_diagnostics(path, file_existed_before, [], [], new_rows)
         return
-    existing_header, existing_rows = _read_existing_usage_log(path)
-    header = []
-    for col in existing_header + PLANT_USAGE_LOG_BASE_COLUMNS + PLANT_USAGE_LOG_MIX_COLUMNS:
-        if col and col not in header:
-            header.append(col)
-    all_rows = existing_rows + new_rows
     try:
-        _write_csv_atomic(path, header, all_rows)
-        LOGGER.info('MIX LOGS: appended {0} mix usage rows to {1}'.format(len(new_rows), path))
-        _log_mix_usage_diagnostics(path, file_existed_before, existing_header, header, new_rows)
-    except Exception as ex:
-        LOGGER.warning('MASS PLANTING PATHS: shared usage log unavailable: {0}'.format(ex))
-        fallback = _fallback_usage_log_path()
-        if _path_key(fallback) == _path_key(path):
-            raise
-        LOGGER.warning('MASS PLANTING PATHS: shared usage log unavailable. Using fallback log: {0}'.format(fallback))
-        existing_header, existing_rows = _read_existing_usage_log(fallback)
+        existing_header, existing_rows = _read_existing_usage_log(path)
         header = []
         for col in existing_header + PLANT_USAGE_LOG_BASE_COLUMNS + PLANT_USAGE_LOG_MIX_COLUMNS:
             if col and col not in header:
                 header.append(col)
-        _write_csv_atomic(fallback, header, existing_rows + new_rows)
-        LOGGER.info('MIX LOGS: appended {0} mix usage rows to {1}'.format(len(new_rows), fallback))
-        _log_mix_usage_diagnostics(fallback, os.path.exists(fallback), existing_header, header, new_rows)
+        all_rows = existing_rows + new_rows
+        _write_csv_atomic(path, header, all_rows)
+        LOGGER.info('MASSED PLANTING USAGE: Wrote {0} usage row(s) to {1}.'.format(len(new_rows), path))
+        _log_mix_usage_diagnostics(path, file_existed_before, existing_header, header, new_rows)
+    except Exception as ex:
+        LOGGER.warning(
+            'MASSED PLANTING USAGE: Could not write to the configured shared usage log: '
+            '{0}. Usage logging was skipped. Revit changes were not affected. {1}'.format(path, ex)
+        )
+
 
 def get_param(element, name):
     """Safe parameter getter returning a Python string or None."""
@@ -1999,18 +1757,14 @@ class MixWindowController(object):
     # ---- Plant Library ----
     def _run_create_plant_script(self):
         """Run the Create Plant pushbutton script from Mix Editor."""
-        plant_library = _load_current_plant_library_module()
-        if plant_library is None:
+        if not os.path.exists(CREATE_PLANT_SCRIPT_PATH):
             forms.alert(
-                u"Could not find the current deployed Plant Library. Search attempts:\n{0}"
-                .format(_format_create_plant_resolution_attempts()),
+                u"Could not find Create Plant script at:\n{0}".format(CREATE_PLANT_SCRIPT_PATH),
                 title="Add Plant (library)"
             )
             return
-
         try:
-            if hasattr(plant_library, 'main'):
-                plant_library.main()
+            imp.load_source("create_plant_pushbutton_script", CREATE_PLANT_SCRIPT_PATH)
         except Exception as ex:
             forms.alert(
                 u"Error while running Create Plant script:\n{0}".format(ex),
@@ -3781,11 +3535,18 @@ class MixWindowController(object):
         # ------------------------------------------------------------
         # 1. Load the Create Plant script as a module
         # ------------------------------------------------------------
-        plant_library = _load_current_plant_library_module()
-        if plant_library is None:
+        if not os.path.exists(CREATE_PLANT_SCRIPT_PATH):
             forms.alert(
-                u"Could not find the current deployed Plant Library. Search attempts:\n{0}"
-                .format(_format_create_plant_resolution_attempts()),
+                u"Could not find Create Plant script at:\n{0}".format(CREATE_PLANT_SCRIPT_PATH),
+                title="Add Plant (library)"
+            )
+            return
+
+        try:
+            plant_library = imp.load_source("plant_library_for_mix", CREATE_PLANT_SCRIPT_PATH)
+        except Exception as ex:
+            forms.alert(
+                u"Error loading Create Plant script:\n{0}".format(ex),
                 title="Add Plant (library)"
             )
             return

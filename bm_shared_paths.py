@@ -45,7 +45,6 @@ PLANT_LIBRARY_EVENT_LOG_ROOT = normalise_path(os.path.join(PLANT_LIBRARY_LOG_ROO
 PLANT_LIBRARY_CUSTOM_PLANTS_CSV = normalise_path(os.path.join(PLANT_LIBRARY_DATA_ROOT, 'Custom_Plants.csv'))
 PLANT_LIBRARY_USAGE_LOG_CSV = normalise_path(os.path.join(PLANT_LIBRARY_LOG_ROOT, 'plant_usage_log.csv'))
 PLANT_LIBRARY_MODEL_SNAPSHOT_LOG_CSV = normalise_path(os.path.join(PLANT_LIBRARY_LOG_ROOT, 'plant_model_snapshot_log.csv'))
-MASSED_PLANTING_EDITOR_USAGE_LOG_CSV = PLANT_LIBRARY_USAGE_LOG_CSV
 
 TOOL_PATHS = {
     'plant_library': {
@@ -56,13 +55,7 @@ TOOL_PATHS = {
         'usage_log_csv': PLANT_LIBRARY_USAGE_LOG_CSV,
         'model_snapshot_log_csv': PLANT_LIBRARY_MODEL_SNAPSHOT_LOG_CSV,
     },
-    'massed_planting_editor': {
-        'usage_log_csv': MASSED_PLANTING_EDITOR_USAGE_LOG_CSV,
-        'log_root': PLANT_LIBRARY_LOG_ROOT,
-    },
 }
-
-TOOL_SCRIPT_LOCATIONS = {}
 
 
 def get_tool_path(tool_name, key, default=''):
@@ -70,13 +63,6 @@ def get_tool_path(tool_name, key, default=''):
         return normalise_path(TOOL_PATHS.get(tool_name, {}).get(key, default))
     except Exception:
         return normalise_path(default)
-
-
-def get_tool_script_path(tool_name, default=None):
-    relative_path = TOOL_SCRIPT_LOCATIONS.get(tool_name)
-    if not relative_path:
-        return normalise_path(default)
-    return normalise_path(os.path.join(get_extension_root(), relative_path))
 
 
 def is_environment_override_active():
