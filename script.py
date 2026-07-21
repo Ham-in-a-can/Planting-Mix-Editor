@@ -16,6 +16,13 @@ Adds:
 import os
 import sys
 import imp
+import csv
+import uuid
+import shutil
+import hashlib
+import getpass
+import tempfile
+import datetime
 import clr
 
 from pyrevit import revit, DB, script, forms
@@ -107,18 +114,24 @@ COLOR_SCHEME_CATEGORY = DB.BuiltInCategory.OST_Areas   # Category for scheme
 DEFAULT_AREA_COLORS = [
     (u'Soft Green',   DB.Color(198, 224, 180)),
     (u'Mid Green',    DB.Color(169, 209, 142)),
+    (u'Yellow Green', DB.Color(217, 234, 168)),
     (u'Olive',        DB.Color(143, 188, 143)),
+    (u'Mint',         DB.Color(201, 230, 214)),
+    (u'Blue Green',   DB.Color(182, 215, 210)),
+    (u'Aqua',         DB.Color(208, 236, 231)),
     (u'Blue',         DB.Color(189, 215, 238)),
-    (u'Yellow',       DB.Color(255, 242, 204)),
-    (u'Orange',       DB.Color(252, 213, 180)),
+    (u'Lavender',     DB.Color(217, 210, 233)),
+    (u'Mauve',        DB.Color(208, 197, 226)),
     (u'Red',          DB.Color(244, 199, 195)),
-    (u'Grey',         DB.Color(217, 217, 217)),
-    (u'Dark Green',   DB.Color(0,   97,  0)),
-    (u'Deep Blue',    DB.Color(0,   112, 192)),
-    (u'Purple',       DB.Color(112, 48,  160)),
-    (u'Brown',        DB.Color(150, 75,  0)),
-    (u'Light Grey',   DB.Color(242, 242, 242)),
+    (u'Orange',       DB.Color(252, 213, 180)),
+    (u'Clay',         DB.Color(224, 184, 164)),
+    (u'Sand',         DB.Color(234, 220, 196)),
+    (u'Yellow',       DB.Color(255, 242, 204)),
 ]
+
+QUICK_COLOR_SWATCH_SIZE = 22
+QUICK_COLOR_SWATCH_MARGIN = 2
+QUICK_COLOR_COLUMNS = 5
 
 # Filled Region strip configuration (schedule colour bars)
 FILLED_REGION_WIDTH_MM = 20.0
@@ -128,19 +141,98 @@ FILLED_REGION_HEIGHT_MM = 4.0
 DEBUG_FILLED_REGION = False
 
 
-#Path to plant library script
+# Path to plant library script
 CREATE_PLANT_SCRIPT_PATH = r"C:\Users\hamishc\OneDrive - Boffa Miskell\Desktop\Shared_Dynamo\ToolBar\OnServer\BoffaTestTools.extension\BoffaTools.tab\Test.panel\Create Plant.pushbutton\script.py"
 
 
 # Path to XAML file (placed next to this script)
 try:
-    SCRIPT_DIR = os.path.dirname(__file__)
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 except Exception:
     try:
         from pyrevit import script as _script_mod
-        SCRIPT_DIR = os.path.dirname(_script_mod.get_script_path())
+        SCRIPT_DIR = os.path.dirname(os.path.abspath(_script_mod.get_script_path()))
     except Exception:
         SCRIPT_DIR = os.getcwd()
+
+
+def _normalise_path_basic(path):
+    if not path:
+        return u''
+    try:
+        return os.path.normpath(os.path.abspath(path))
+    except Exception:
+        return os.path.normpath(path)
+
+
+def _find_bm_shared_paths_root(start_dir, filename='bm_shared_paths.py'):
+    current = _normalise_path_basic(start_dir)
+    for index in range(12):
+        candidate = os.path.join(current, filename)
+        if os.path.isfile(candidate):
+            return current
+        parent = os.path.dirname(current)
+        if not parent or parent == current:
+            break
+        current = parent
+    return None
+
+
+MASSED_EDITOR_SCRIPT_DIR = SCRIPT_DIR
+BM_SHARED_PATHS_ROOT = _find_bm_shared_paths_root(MASSED_EDITOR_SCRIPT_DIR)
+if BM_SHARED_PATHS_ROOT and BM_SHARED_PATHS_ROOT not in sys.path:
+    sys.path.insert(0, BM_SHARED_PATHS_ROOT)
+
+try:
+    import bm_shared_paths
+    BM_SHARED_PATHS_IMPORT_ERROR = None
+except Exception as ex:
+    bm_shared_paths = None
+    BM_SHARED_PATHS_IMPORT_ERROR = ex
+
+
+def _shared_normalise(path):
+    if bm_shared_paths is not None:
+        try:
+            return bm_shared_paths.normalise_path(path)
+        except Exception:
+            pass
+    return _normalise_path_basic(path) if path else u''
+
+
+def _resolve_massed_editor_usage_log_path():
+    if bm_shared_paths is None:
+        return u''
+    path = u''
+    try:
+        path = bm_shared_paths.get_tool_path('plant_library', 'usage_log_csv', '')
+    except Exception:
+        path = u''
+    if not path:
+        try:
+            path = bm_shared_paths.PLANT_LIBRARY_USAGE_LOG_CSV
+        except Exception:
+            path = u''
+    if not path:
+        return u''
+    return _shared_normalise(path)
+
+
+MASSED_EDITOR_USAGE_LOG_PATH = _resolve_massed_editor_usage_log_path()
+
+try:
+    _bm_shared_paths_file = os.path.join(BM_SHARED_PATHS_ROOT, 'bm_shared_paths.py') if BM_SHARED_PATHS_ROOT else u'(unresolved)'
+    LOGGER.info('MASSED PLANTING USAGE: bm_shared_paths.py = {0}'.format(_bm_shared_paths_file))
+    LOGGER.info('MASSED PLANTING USAGE: usage_log_csv = {0}'.format(MASSED_EDITOR_USAGE_LOG_PATH or u'(unresolved)'))
+    LOGGER.info('MASSED PLANTING USAGE: Plant Library script = {0}'.format(CREATE_PLANT_SCRIPT_PATH))
+    if bm_shared_paths is None or not MASSED_EDITOR_USAGE_LOG_PATH:
+        LOGGER.warning(
+            'MASSED PLANTING USAGE: Shared usage-log path could not be resolved from '
+            'bm_shared_paths.py. Usage logging will be skipped; planting mix operations are not affected.'
+        )
+except Exception:
+    # Diagnostics must never prevent the editor from loading.
+    pass
 
 XAML_FILE = os.path.join(SCRIPT_DIR, 'mix_schedules.xaml')
 DUPLICATE_ICON_PATH = os.path.join(SCRIPT_DIR, DUPLICATE_ICON_NAME)
@@ -307,6 +399,281 @@ def _to_unicode(value):
             return str(value)
         except Exception:
             return u''
+
+
+
+def _hash_log_value(value):
+    text = _to_unicode(value).strip()
+    if not text:
+        return u''
+    try:
+        data = text.encode('utf-8')
+    except Exception:
+        data = str(text)
+    try:
+        return hashlib.sha256(data).hexdigest()
+    except Exception:
+        return u''
+
+
+
+
+def _get_doc_path(doc):
+    try:
+        return doc.GetWorksharingCentralModelPath().ToString()
+    except Exception:
+        pass
+    try:
+        return doc.PathName
+    except Exception:
+        return u''
+
+
+PLANT_USAGE_LOG_BASE_COLUMNS = [
+    'timestamp_utc', 'sheet', 'botanical', 'common', 'plant_grade', 'user',
+    'project_number', 'project_name', 'timestamp', 'model_title',
+    'document_title', 'revit_version', 'central_model_path_hash',
+    'model_name_hash', 'plant_code', 'source_sheet', 'family_name'
+]
+
+PLANT_USAGE_LOG_MIX_COLUMNS = [
+    'usage_event_type', 'source_tool', 'mode', 'mix_name', 'mix_element_id_hash',
+    'mix_unique_id_hash', 'target_view_name', 'target_view_id_hash',
+    'mix_family_name', 'mix_species_index', 'mix_species_count', 'mix_percent',
+    'mix_spacing', 'mix_grade', 'mix_code', 'mix_botanical', 'mix_common',
+    'applied_to_revit', 'session_id'
+]
+
+MIX_USAGE_LOG_EXCLUDED_MIX_NAMES = [
+    u'Placeholder Mix',
+]
+
+
+def _is_excluded_mix_for_usage_log(mix_name):
+    name = _to_unicode(mix_name).strip().lower()
+    for excluded in MIX_USAGE_LOG_EXCLUDED_MIX_NAMES:
+        if name == _to_unicode(excluded).strip().lower():
+            return True
+    return False
+
+
+
+def _csv_cell(value):
+    text = _to_unicode(value)
+    return u'"' + text.replace(u'"', u'""') + u'"'
+
+
+def _write_csv_atomic(path, header, rows):
+    folder = os.path.dirname(path)
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+    fd, tmp_path = tempfile.mkstemp(prefix='plant_usage_', suffix='.csv', dir=folder)
+    os.close(fd)
+    try:
+        with open(tmp_path, 'wb') as fh:
+            lines = []
+            lines.append(u','.join([_csv_cell(h) for h in header]))
+            for row in rows:
+                lines.append(u','.join([_csv_cell(row.get(h, u'')) for h in header]))
+            data = (u'\n'.join(lines) + u'\n').encode('utf-8')
+            fh.write(data)
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+        shutil.move(tmp_path, path)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def _read_existing_usage_log(path):
+    if not os.path.exists(path):
+        return [], []
+    try:
+        with open(path, 'rb') as fh:
+            data = fh.read()
+        try:
+            text = data.decode('utf-8-sig')
+        except Exception:
+            text = data.decode('utf-8', 'ignore')
+        lines = text.splitlines()
+        if not lines:
+            return [], []
+        reader = csv.DictReader(lines)
+        header = list(reader.fieldnames or [])
+        rows = []
+        for row in reader:
+            clean = {}
+            for k, v in row.items():
+                if k is not None:
+                    clean[_to_unicode(k)] = _to_unicode(v)
+            rows.append(clean)
+        return header, rows
+    except Exception as ex:
+        LOGGER.debug('MIX LOGS: failed to read existing plant usage log: {0}'.format(ex))
+        return [], []
+
+
+def _doc_project_info(doc):
+    info = {}
+    try:
+        pi = doc.ProjectInformation
+    except Exception:
+        pi = None
+    for key, param_name in (('project_number', 'Project Number'), ('project_name', 'Project Name')):
+        val = u''
+        try:
+            val = get_param(pi, param_name)
+        except Exception:
+            val = u''
+        info[key] = val or u''
+    return info
+
+
+def _build_mix_usage_rows(doc, mixes, target_view, session_id):
+    now_local = datetime.datetime.now()
+    now_utc = datetime.datetime.utcnow()
+    project_info = _doc_project_info(doc)
+    doc_path = _get_doc_path(doc)
+    try:
+        revit_version = __revit__.Application.VersionNumber
+    except Exception:
+        revit_version = u''
+    try:
+        user_name = __revit__.Application.Username
+    except Exception:
+        try:
+            user_name = getpass.getuser()
+        except Exception:
+            user_name = u''
+    try:
+        doc_title = doc.Title
+    except Exception:
+        doc_title = u''
+    target_view_name = u''
+    target_view_id_hash = u''
+    if target_view is not None:
+        try:
+            target_view_name = target_view.Name
+        except Exception:
+            pass
+        try:
+            target_view_id_hash = _hash_log_value(_get_element_id_int(target_view.Id))
+        except Exception:
+            pass
+
+    rows = []
+    for mix in mixes:
+        mix_name = getattr(mix, 'mix_name', u'') or u''
+        if _is_excluded_mix_for_usage_log(mix_name):
+            LOGGER.info('MIX LOGS: skipping excluded mix "{0}".'.format(mix_name))
+            continue
+        species = [r for r in mix.rows if (r.code or r.bot or r.com)]
+        species_count = len(species)
+        if species_count <= 0:
+            continue
+        try:
+            mix_element_id_hash = _hash_log_value(_get_element_id_int(mix.element.Id))
+        except Exception:
+            mix_element_id_hash = u''
+        try:
+            mix_unique_id_hash = _hash_log_value(mix.element.UniqueId)
+        except Exception:
+            mix_unique_id_hash = u''
+        idx = 0
+        for row in mix.rows:
+            if not (row.code or row.bot or row.com):
+                continue
+            idx += 1
+            log_row = {
+                'timestamp': now_local.strftime('%Y-%m-%d %H:%M:%S'),
+                'timestamp_utc': now_utc.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'user': user_name,
+                'project_number': project_info.get('project_number', u''),
+                'project_name': project_info.get('project_name', u''),
+                'model_title': doc_title,
+                'document_title': doc_title,
+                'revit_version': revit_version,
+                'central_model_path_hash': _hash_log_value(doc_path),
+                'model_name_hash': _hash_log_value(doc_title),
+                'sheet': 'Mix Editor',
+                'botanical': row.bot or u'',
+                'common': row.com or u'',
+                'plant_grade': row.grade or u'',
+                'plant_code': row.code or u'',
+                'source_sheet': u'',
+                'family_name': u'',
+                'usage_event_type': 'mix_species_applied_to_revit',
+                'source_tool': 'massed_planting_editor',
+                'mode': 'mix_editor_apply',
+                'mix_name': mix.mix_name or u'',
+                'mix_element_id_hash': mix_element_id_hash,
+                'mix_unique_id_hash': mix_unique_id_hash,
+                'target_view_name': target_view_name,
+                'target_view_id_hash': target_view_id_hash,
+                'mix_family_name': FAMILY_NAME,
+                'mix_species_index': idx,
+                'mix_species_count': species_count,
+                'mix_percent': row.pct or u'',
+                'mix_spacing': row.spacing or u'',
+                'mix_grade': row.grade or u'',
+                'mix_code': row.code or u'',
+                'mix_botanical': row.bot or u'',
+                'mix_common': row.com or u'',
+                'applied_to_revit': 'true',
+                'session_id': session_id
+            }
+            rows.append(log_row)
+    return rows
+
+
+
+def _log_mix_usage_diagnostics(path, file_existed_before, existing_header, merged_header, new_rows):
+    try:
+        LOGGER.info('MIX LOGS DIAGNOSTIC: resolved usage log path: {0}'.format(path))
+        LOGGER.info('MIX LOGS DIAGNOSTIC: file existed before write: {0}'.format(file_existed_before))
+        LOGGER.info('MIX LOGS DIAGNOSTIC: old header column count: {0}'.format(len(existing_header or [])))
+        LOGGER.info('MIX LOGS DIAGNOSTIC: merged header column count: {0}'.format(len(merged_header or [])))
+        LOGGER.info('MIX LOGS DIAGNOSTIC: new row count: {0}'.format(len(new_rows or [])))
+        if os.path.exists(path):
+            LOGGER.info('MIX LOGS DIAGNOSTIC: final file size: {0}'.format(os.path.getsize(path)))
+    except Exception as ex:
+        LOGGER.warning('MIX LOGS: failed to write diagnostics: {0}'.format(ex))
+
+def _append_mix_usage_log_rows(doc, mixes, target_view, session_id):
+    path = MASSED_EDITOR_USAGE_LOG_PATH
+    if not path:
+        LOGGER.warning(
+            'MASSED PLANTING USAGE: Shared usage-log path could not be resolved from '
+            'bm_shared_paths.py. Usage logging was skipped. The planting mix operation was not affected.'
+        )
+        return
+    file_existed_before = os.path.exists(path)
+    new_rows = _build_mix_usage_rows(doc, mixes, target_view, session_id)
+    if not new_rows:
+        LOGGER.info('MIX LOGS: no non-empty mix species rows found to log.')
+        _log_mix_usage_diagnostics(path, file_existed_before, [], [], new_rows)
+        return
+    try:
+        existing_header, existing_rows = _read_existing_usage_log(path)
+        header = []
+        for col in existing_header + PLANT_USAGE_LOG_BASE_COLUMNS + PLANT_USAGE_LOG_MIX_COLUMNS:
+            if col and col not in header:
+                header.append(col)
+        all_rows = existing_rows + new_rows
+        _write_csv_atomic(path, header, all_rows)
+        LOGGER.info('MASSED PLANTING USAGE: Wrote {0} usage row(s) to {1}.'.format(len(new_rows), path))
+        _log_mix_usage_diagnostics(path, file_existed_before, existing_header, header, new_rows)
+    except Exception as ex:
+        LOGGER.warning(
+            'MASSED PLANTING USAGE: Could not write to the configured shared usage log: '
+            '{0}. Usage logging was skipped. Revit changes were not affected. {1}'.format(path, ex)
+        )
 
 
 def get_param(element, name):
@@ -489,6 +856,126 @@ def _get_color_entry_keys(entry):
     return val_key, cap_key
 
 
+def _normalise_mix_name(name):
+    return _to_unicode(name).strip().lower()
+
+
+def _get_effective_mix_color(mix):
+    """Return the colour that represents the mix for the current edit session."""
+    if mix is None:
+        return None
+    color = getattr(mix, 'area_color_new_dbcolor', None)
+    if color is not None:
+        return color
+    rename = getattr(mix, 'pending_rename', None)
+    if rename:
+        color = rename.get('source_color')
+        if color is not None:
+            return color
+    color = getattr(mix, 'area_color_dbcolor', None)
+    if color is not None:
+        return color
+    return _get_entry_color(getattr(mix, 'area_color_entry', None))
+
+
+def _format_dbcolor(color):
+    if color is None:
+        return u'<none>'
+    try:
+        return u'RGB({0},{1},{2})'.format(color.Red, color.Green, color.Blue)
+    except Exception:
+        return u'<invalid>'
+
+
+def _find_color_entry(entries, name):
+    wanted = _normalise_mix_name(name)
+    if not wanted:
+        return None
+    for entry in entries or []:
+        value, caption = _get_color_entry_keys(entry)
+        if (_normalise_mix_name(value) == wanted or
+                _normalise_mix_name(caption) == wanted):
+            return entry
+    return None
+
+
+def _snapshot_color_entry(entry):
+    """Copy writable scheme-entry graphics without retaining the entry object."""
+    if entry is None:
+        return None
+    value, caption = _get_color_entry_keys(entry)
+    data = {
+        'value': value,
+        'caption': caption,
+        'color': _get_entry_color(entry),
+    }
+    for attr in ('FillPatternId', 'IsVisible'):
+        try:
+            data[attr] = getattr(entry, attr)
+        except Exception:
+            pass
+    return data
+
+
+def _copy_color_entry_graphics(source_data, target_entry, target_name, color):
+    if target_entry is None:
+        return
+    if source_data:
+        for attr in ('FillPatternId', 'IsVisible'):
+            if attr in source_data:
+                try:
+                    setattr(target_entry, attr, source_data[attr])
+                except Exception:
+                    pass  # Property availability and writability varies by Revit version.
+        caption = source_data.get('caption', u'')
+        source_value = source_data.get('value', u'')
+        if caption and _normalise_mix_name(caption) != _normalise_mix_name(source_value):
+            try:
+                target_entry.Caption = caption
+            except Exception:
+                pass
+    _set_entry_color(target_entry, color or (source_data or {}).get('color'))
+
+
+def _get_color_scheme_consistency_text(result):
+    """Return the most useful available description of a Revit consistency enum."""
+    try:
+        return _to_unicode(result.ToString())
+    except Exception:
+        pass
+    try:
+        return _to_unicode(result)
+    except Exception:
+        pass
+    try:
+        return _to_unicode(int(result))
+    except Exception:
+        return u'<unknown>'
+
+
+def _is_color_scheme_entries_consistent(result):
+    """Explicitly interpret EntryAndSchemeConsistency; Consistent is zero."""
+    consistent_value = None
+    try:
+        consistent_value = DB.EntryAndSchemeConsistency.Consistent
+    except Exception:
+        pass
+
+    if consistent_value is not None:
+        try:
+            return result == consistent_value
+        except Exception:
+            return False
+
+    try:
+        return int(result) == 0
+    except Exception:
+        pass
+
+    return (_get_color_scheme_consistency_text(result).strip().lower() ==
+            u'consistent')
+
+
 def _dbcolor_to_media_brush(db_color):
     """Convert Revit.DB.Color to a WPF SolidColorBrush for UI preview."""
     try:
@@ -503,9 +990,58 @@ def _dbcolor_to_media_brush(db_color):
         return Media.SolidColorBrush(Media.Colors.LightGray)
 
 
-def pick_color_with_revit_dialog(initial_dbcolor):
+def _reactivate_window(window):
+    """Best-effort focus helper for returning to the mix schedules window."""
+    if window is None:
+        return
+    try:
+        if window.WindowState == System.Windows.WindowState.Minimized:
+            window.WindowState = System.Windows.WindowState.Normal
+    except Exception:
+        pass
+    try:
+        window.Activate()
+    except Exception:
+        pass
+    try:
+        # A brief Topmost toggle helps WPF reclaim focus after native Revit dialogs
+        # without leaving the editor permanently above every other window.
+        window.Topmost = True
+        window.Topmost = False
+        window.Focus()
+    except Exception:
+        pass
+
+
+def _is_revit_color_dialog_cancelled(result):
+    """Return True when ColorSelectionDialog.Show reports an explicit cancel."""
+    if result is False:
+        return True
+    if result is None:
+        return False
+
+    try:
+        if result == ItemSelectionDialogResult.Canceled:
+            return True
+    except Exception:
+        pass
+
+    try:
+        result_text = result.ToString()
+    except Exception:
+        try:
+            result_text = str(result)
+        except Exception:
+            result_text = u''
+
+    result_text = _to_unicode(result_text).lower()
+    return result_text.endswith('canceled') or result_text.endswith('cancelled')
+
+
+def pick_color_with_revit_dialog(initial_dbcolor, owner_window=None):
     """Try Revit's ColorSelectionDialog, then WinForms ColorDialog. Returns DB.Color or None."""
     if HAS_REVIT_COLOR_DIALOG:
+        dialog_was_shown = False
         try:
             dlg = ColorSelectionDialog()
             if initial_dbcolor is not None:
@@ -513,18 +1049,32 @@ def pick_color_with_revit_dialog(initial_dbcolor):
                     dlg.SelectedColor = initial_dbcolor
                 except Exception:
                     pass
-            try:
-                ColorSelectionDialog.Show(dlg)
-            except Exception:
-                try:
-                    dlg.Show()
-                except Exception:
-                    pass
+
+            result = dlg.Show()
+            dialog_was_shown = True
+
+            # Revit returns ItemSelectionDialogResult. Canceled is an enum value
+            # (not False), so check it explicitly before reading SelectedColor.
+            if _is_revit_color_dialog_cancelled(result):
+                return None
+
             col = dlg.SelectedColor
-            if col is not None and col.IsValidObject:
-                return col
+            if col is not None:
+                is_valid = True
+                try:
+                    is_valid = col.IsValidObject
+                except Exception:
+                    is_valid = True
+                if is_valid:
+                    return col
+            return None
         except Exception:
-            pass
+            # Only fall back to WinForms if Revit's picker could not be displayed.
+            # If it displayed and the user cancelled, do not open a second picker.
+            if dialog_was_shown:
+                return None
+        finally:
+            _reactivate_window(owner_window)
 
     # Fallback: WinForms
     try:
@@ -553,7 +1103,7 @@ def pick_color_with_revit_dialog(initial_dbcolor):
         return None
 
 
-def pick_area_color_with_palette(initial_dbcolor):
+def pick_area_color_with_palette(initial_dbcolor, owner_window=None):
     """Small palette window + 'More colours...' button. Returns DB.Color or None."""
     selected = {'color': None}
 
@@ -562,6 +1112,11 @@ def pick_area_color_with_palette(initial_dbcolor):
     win.SizeToContent = SizeToContent.WidthAndHeight
     win.WindowStartupLocation = WindowStartupLocation.CenterScreen
     win.ResizeMode = 0  # NoResize
+    if owner_window is not None:
+        try:
+            win.Owner = owner_window
+        except Exception:
+            pass
 
     root = StackPanel()
     root.Margin = Thickness(10)
@@ -575,13 +1130,16 @@ def pick_area_color_with_palette(initial_dbcolor):
 
     wrap = WrapPanel()
     wrap.Margin = Thickness(0, 0, 0, 8)
+    # Keep the quick colour palette at a predictable width so added defaults
+    # wrap into visible rows instead of stretching the popup horizontally.
+    wrap.Width = QUICK_COLOR_COLUMNS * (QUICK_COLOR_SWATCH_SIZE + (QUICK_COLOR_SWATCH_MARGIN * 2))
     root.Children.Add(wrap)
 
     for name, dbcol in DEFAULT_AREA_COLORS:
         sw = Border()
-        sw.Width = 22
-        sw.Height = 22
-        sw.Margin = Thickness(2)
+        sw.Width = QUICK_COLOR_SWATCH_SIZE
+        sw.Height = QUICK_COLOR_SWATCH_SIZE
+        sw.Margin = Thickness(QUICK_COLOR_SWATCH_MARGIN)
         sw.CornerRadius = CornerRadius(3)
         sw.BorderThickness = Thickness(1)
         sw.BorderBrush = Media.Brushes.Gray
@@ -605,7 +1163,7 @@ def pick_area_color_with_palette(initial_dbcolor):
     more_btn.Padding = Thickness(6, 2, 6, 2)
 
     def on_more(sender, args):
-        col = pick_color_with_revit_dialog(initial_dbcolor)
+        col = pick_color_with_revit_dialog(initial_dbcolor, owner_window or win)
         if col is not None:
             selected['color'] = col
             try:
@@ -618,6 +1176,7 @@ def pick_area_color_with_palette(initial_dbcolor):
             except Exception:
                 pass
         win.Close()
+        _reactivate_window(owner_window)
 
     more_btn.Click += on_more
     root.Children.Add(more_btn)
@@ -626,6 +1185,8 @@ def pick_area_color_with_palette(initial_dbcolor):
         result = win.ShowDialog()
     except Exception:
         result = None
+    finally:
+        _reactivate_window(owner_window)
 
     if result:
         return selected['color']
@@ -637,7 +1198,7 @@ def _sanitize_mix_name_for_type(mix_name):
     base = _to_unicode(mix_name).strip()
     if not base:
         base = u'Unnamed'
-    for ch in u'<>:"/\|?*':
+    for ch in u'<>:"/\\|?*':
         base = base.replace(ch, u'_')
     return base
 
@@ -711,6 +1272,142 @@ def _set_filled_region_type_color(fr_type, color):
                 ex
             )
         )
+
+
+def _get_filled_region_type_by_name(doc, type_name):
+    try:
+        types = DB.FilteredElementCollector(doc).OfClass(DB.FilledRegionType)
+    except Exception:
+        types = []
+    wanted = _to_unicode(type_name).strip().lower()
+    for fr_type in types:
+        try:
+            if _to_unicode(get_element_name(fr_type)).strip().lower() == wanted:
+                return fr_type
+        except Exception:
+            continue
+    return None
+
+
+def _is_mix_color_strip_region(region, host_view):
+    """Identify only the small origin rectangle created by this editor."""
+    if region is None or host_view is None:
+        return False
+    try:
+        bbox = region.get_BoundingBox(host_view)
+        if bbox is None:
+            return False
+        expected_w = FILLED_REGION_WIDTH_MM / 304.8
+        expected_h = FILLED_REGION_HEIGHT_MM / 304.8
+        tolerance = 2.0 / 304.8
+        return (abs(bbox.Min.X) <= tolerance and
+                abs(bbox.Min.Y) <= tolerance and
+                abs((bbox.Max.X - bbox.Min.X) - expected_w) <= tolerance and
+                abs((bbox.Max.Y - bbox.Min.Y) - expected_h) <= tolerance)
+    except Exception:
+        return False
+
+
+def _migrate_filled_region_for_rename(doc, old_mix_name, new_mix_name,
+                                      color, host_view):
+    """Move bm_planting strip identity to a renamed mix."""
+    result = {'status': 'not found', 'retyped': 0, 'old_type_removed': False}
+    old_type_name = u'bm_planting_{0}'.format(
+        _sanitize_mix_name_for_type(old_mix_name))
+    new_type_name = u'bm_planting_{0}'.format(
+        _sanitize_mix_name_for_type(new_mix_name))
+    old_type = _get_filled_region_type_by_name(doc, old_type_name)
+    target_type = _get_filled_region_type_by_name(doc, new_type_name)
+
+    if _normalise_mix_name(old_type_name) == _normalise_mix_name(new_type_name):
+        target_type = target_type or old_type
+        if target_type is not None:
+            _set_filled_region_type_color(target_type, color)
+            result['status'] = 'updated'
+        return result
+
+    if old_type is not None and target_type is None:
+        try:
+            duplicate_result = old_type.Duplicate(new_type_name)
+            if isinstance(duplicate_result, DB.FilledRegionType):
+                target_type = duplicate_result
+            else:
+                target_type = doc.GetElement(duplicate_result)
+            result['status'] = 'duplicated from source'
+        except Exception as ex:
+            LOGGER.warning(
+                'Rename colour migration: could not duplicate FilledRegionType '
+                '"{0}" as "{1}": {2}'.format(old_type_name, new_type_name, ex))
+
+    if target_type is not None:
+        _set_filled_region_type_color(target_type, color)
+
+    if old_type is not None and target_type is not None:
+        try:
+            regions = DB.FilteredElementCollector(doc).OfClass(DB.FilledRegion)
+        except Exception:
+            regions = []
+        for region in regions:
+            try:
+                if (_get_element_id_int(region.GetTypeId()) ==
+                        _get_element_id_int(old_type.Id)):
+                    region.ChangeTypeId(target_type.Id)
+                    result['retyped'] += 1
+            except Exception as ex:
+                LOGGER.warning(
+                    'Rename colour migration: could not retype FilledRegion {0}: {1}'
+                    .format(_get_element_id_int(region.Id), ex))
+
+        still_used = False
+        try:
+            regions = DB.FilteredElementCollector(doc).OfClass(DB.FilledRegion)
+        except Exception:
+            regions = []
+        for region in regions:
+            try:
+                if (_get_element_id_int(region.GetTypeId()) ==
+                        _get_element_id_int(old_type.Id)):
+                    still_used = True
+                    break
+            except Exception:
+                continue
+        if not still_used:
+            try:
+                doc.Delete(old_type.Id)
+                result['old_type_removed'] = True
+            except Exception:
+                pass  # The type can be protected or referenced outside visible strips.
+
+        # A pre-existing target strip plus a retyped source strip can otherwise
+        # leave two editor-created rectangles at the origin. Never delete other
+        # FilledRegions merely because they use the same type.
+        if host_view is not None:
+            try:
+                view_regions = (DB.FilteredElementCollector(doc, host_view.Id)
+                                .OfClass(DB.FilledRegion))
+            except Exception:
+                view_regions = []
+            strip_regions = []
+            for region in view_regions:
+                try:
+                    if (_get_element_id_int(region.GetTypeId()) ==
+                            _get_element_id_int(target_type.Id) and
+                            _is_mix_color_strip_region(region, host_view)):
+                        strip_regions.append(region)
+                except Exception:
+                    continue
+            for duplicate in strip_regions[1:]:
+                try:
+                    doc.Delete(duplicate.Id)
+                except Exception:
+                    pass  # Preserve workflow if an individual strip cannot be deleted.
+
+    if target_type is None and color is not None:
+        _ensure_filled_region_for_mix(doc, new_mix_name, color, host_view)
+        result['status'] = 'created from template'
+    elif target_type is not None and result['status'] == 'not found':
+        result['status'] = 'updated target'
+    return result
 
 
 
@@ -879,14 +1576,15 @@ def _ensure_filled_region_for_mix(doc, mix_name, color, host_view):
         )
 
 # ---- Percent conversions ----
-def pct_raw_to_display(raw):
-    """Convert stored decimal or percent value to a display string like '50%'.
+def pct_raw_to_display(raw, assume_internal_decimal=True):
+    """Convert a percent value to display text like '50%'.
 
-    Revit percentage parameters are stored internally as decimal fractions
-    (0.5 = 50%), but AsValueString often returns text that already includes
-    a percent sign (for example '1%'). Values that already look like percent
-    text must be displayed exactly as percent values; otherwise '1%' would be
-    interpreted as an internal decimal and incorrectly shown as '100%'.
+    By default this treats raw values as Revit family percentage storage:
+    decimal fractions where 1.0 = 100%, 0.5 = 50%, and 0.01 = 1%.
+
+    Set assume_internal_decimal=False only for already-display-style values
+    from external UI contexts where '1' means 1%, not internal 100%. Values
+    with an explicit percent sign are always treated as display percentages.
     """
     s = _to_unicode(raw).strip()
     if not s:
@@ -906,6 +1604,8 @@ def pct_raw_to_display(raw):
         return u''
     if has_percent_sign:
         perc = val
+    elif assume_internal_decimal:
+        perc = val * 100.0
     elif abs(val) < 1.0 - 1e-9:
         perc = val * 100.0
     else:
@@ -944,6 +1644,40 @@ def pct_display_to_raw(display):
     if not raw_str:
         raw_str = u'0'
     return raw_str
+
+
+def pct_family_raw_to_display(raw):
+    """Convert stored Revit decimal fraction percentage to display text."""
+    return pct_raw_to_display(raw, assume_internal_decimal=True)
+
+
+def pct_user_display_to_family_raw(display):
+    """Convert user-entered display percentage to stored Revit fraction."""
+    return pct_display_to_raw(display)
+
+
+def _run_percent_and_sort_dev_checks():
+    assert pct_family_raw_to_display('1.0') == '100%'
+    assert pct_family_raw_to_display('1') == '100%'
+    assert pct_family_raw_to_display('0.01') == '1%'
+    assert pct_family_raw_to_display('0.1') == '10%'
+    assert pct_family_raw_to_display('0.5') == '50%'
+    assert pct_family_raw_to_display('0.75') == '75%'
+    assert pct_user_display_to_family_raw('1') == '0.01'
+    assert pct_user_display_to_family_raw('1%') == '0.01'
+    assert pct_user_display_to_family_raw('100%') == '1'
+
+    class _DummyRow(object):
+        pass
+    rows = []
+    for name in ('Carex testacea', 'Acaena inermis', 'Poa cita'):
+        r = _DummyRow()
+        r.bot = name
+        r.com = u''
+        r.code = u''
+        rows.append(r)
+    rows.sort(key=_species_row_sort_key)
+    assert [r.bot for r in rows] == ['Acaena inermis', 'Carex testacea', 'Poa cita']
 
 
 # ---- Spacing conversions ----
@@ -1041,6 +1775,22 @@ class SpeciesRow(object):
         self.approx_col_def = None
 
 
+
+def _species_row_sort_key(row):
+    botanical = _to_unicode(getattr(row, 'bot', u'')).strip().lower()
+    common = _to_unicode(getattr(row, 'com', u'')).strip().lower()
+    code = _to_unicode(getattr(row, 'code', u'')).strip().lower()
+    primary = botanical or common or code
+    is_blank = 1 if not primary else 0
+    return (is_blank, primary, common, code)
+
+
+def _sort_mix_rows_alphabetically(mix):
+    mix.rows.sort(key=_species_row_sort_key)
+    for idx, row in enumerate(mix.rows):
+        row.index = idx + 1
+    mix.num_species = len(mix.rows)
+
 class MixModel(object):
     """In-memory representation of a single mix schedule annotation instance."""
     def __init__(self, element):
@@ -1083,6 +1833,7 @@ class MixModel(object):
         self.area_color_dbcolor = None        # Original Revit.DB.Color from scheme
         self.area_color_new_dbcolor = None    # Pending new color to push on Apply
         self.area_color_border = None         # WPF Border used for colour swatch UI
+        self.pending_rename = None             # Identity migration retained until Apply commits
         self.groundcover_icon = _load_bitmap_image(GROUNDCOVER_ICON_PATH)
         self.tree_icon = _load_bitmap_image(TREE_ICON_PATH)
 
@@ -1105,7 +1856,7 @@ class MixModel(object):
             grade     = get_param(self.element, grade_name)
             groundcover_raw = get_param(self.element, groundcover_name)
 
-            pct_display = pct_raw_to_display(pct_raw)
+            pct_display = pct_family_raw_to_display(pct_raw)
             space_display = space_raw_to_display(space_raw)
 
             self.rows.append(
@@ -1114,6 +1865,7 @@ class MixModel(object):
                     _coerce_yes_no_to_bool(groundcover_raw, default=True)
                 )
             )
+        _sort_mix_rows_alphabetically(self)
 
     def remove_row_at(self, index):
         if index < 0 or index >= len(self.rows):
@@ -1234,12 +1986,13 @@ class MixWindowController(object):
         self.current_expanded = None
         self._mix_symbol = None
         self._target_view_id = None
+        self._mix_log_session_id = _to_unicode(uuid.uuid4())
 
         # For manual double-click detection on header
         self._last_header_mix = None
         self._last_header_click_time = None
 
-        # Pending Area renames: list of (old_name, new_name)
+        # Pending identity migrations. Records are also attached to each MixModel.
         self._area_renames = []
 
         # Ghost Area + boundary for seeding names
@@ -1267,10 +2020,7 @@ class MixWindowController(object):
                 title="Add Plant (library)"
             )
             return
-
         try:
-            # Load as a uniquely-named module so it doesn't clash with this script.py
-            # Loading it will execute its top-level code, just like pressing its own button.
             imp.load_source("create_plant_pushbutton_script", CREATE_PLANT_SCRIPT_PATH)
         except Exception as ex:
             forms.alert(
@@ -1444,13 +2194,15 @@ class MixWindowController(object):
                 except Exception:
                     continue
 
+        pending_color = _get_effective_mix_color(mix)
         mix.area_color_entry = entry
-        mix.area_color_new_dbcolor = None
 
         if entry is not None:
             mix.area_color_dbcolor = _get_entry_color(entry)
-        else:
+        elif pending_color is None:
             mix.area_color_dbcolor = None
+        elif getattr(mix, 'area_color_dbcolor', None) is None:
+            mix.area_color_dbcolor = pending_color
 
     def _get_mix_symbol(self):
         """Find and cache the FamilySymbol for the bm_massed_mix generic annotation."""
@@ -1693,13 +2445,46 @@ class MixWindowController(object):
         for mix in self.mixes:
             self._update_approx_numbers_for_mix(mix)
 
-    def _record_mix_rename(self, old_name, new_name):
-        """Record that a mix name changed; will be applied to Areas on Apply."""
+    def _record_mix_rename(self, mix, old_name, new_name):
+        """Record one identity-preserving rename, collapsing chained edits."""
         old_name = _to_unicode(old_name).strip()
         new_name = _to_unicode(new_name).strip()
-        if not old_name or not new_name or old_name == new_name:
+        if not old_name or not new_name:
             return
-        self._area_renames.append((old_name, new_name))
+
+        record = getattr(mix, 'pending_rename', None)
+        if record is None:
+            entry_value, entry_caption = _get_color_entry_keys(
+                getattr(mix, 'area_color_entry', None))
+            record = {
+                'mix': mix,
+                'original_name': old_name,
+                'current_name': new_name,
+                'source_color': _get_effective_mix_color(mix),
+                'source_entry_value': entry_value or None,
+                'source_entry_caption': entry_caption or None,
+                'source_filled_region_type_name': u'bm_planting_{0}'.format(
+                    _sanitize_mix_name_for_type(old_name)),
+                'target_filled_region_type_name': u'bm_planting_{0}'.format(
+                    _sanitize_mix_name_for_type(new_name)),
+                'source_entry_data': None,
+                'areas_renamed': 0,
+            }
+            mix.pending_rename = record
+            self._area_renames.append(record)
+        else:
+            record['current_name'] = new_name
+            record['target_filled_region_type_name'] = u'bm_planting_{0}'.format(
+                _sanitize_mix_name_for_type(new_name))
+            if record.get('source_color') is None:
+                record['source_color'] = _get_effective_mix_color(mix)
+
+        if (record['original_name'].strip() == record['current_name'].strip()):
+            try:
+                self._area_renames.remove(record)
+            except ValueError:
+                pass
+            mix.pending_rename = None
 
     def _generate_copy_name(self, base_name):
         """Generate a unique 'base_name Copy' or 'base_name Copy X' name."""
@@ -2058,10 +2843,7 @@ class MixWindowController(object):
         swatch.Margin = Thickness(0, 0, 0, 0)
         swatch.HorizontalAlignment = HorizontalAlignment.Left
 
-        if mix.area_color_new_dbcolor is not None:
-            brush = _dbcolor_to_media_brush(mix.area_color_new_dbcolor)
-        else:
-            brush = _dbcolor_to_media_brush(mix.area_color_dbcolor)
+        brush = _dbcolor_to_media_brush(_get_effective_mix_color(mix))
         swatch.Background = brush
 
         # If no Area exists for this mix, show "Not Placed" in the swatch
@@ -2550,6 +3332,7 @@ class MixWindowController(object):
         edit_box.FontSize = tb.FontSize
         edit_box.Foreground = tb.Foreground
         edit_box.Tag = mix
+        edit_state = {'finished': False}
 
         if idx >= 0:
             header_stack.Children.Insert(idx, edit_box)
@@ -2557,6 +3340,9 @@ class MixWindowController(object):
             header_stack.Children.Add(edit_box)
 
         def finish_edit(sender, commit):
+            if edit_state['finished']:
+                return
+            edit_state['finished'] = True
             try:
                 text_val = sender.Text or u''
             except Exception:
@@ -2575,13 +3361,31 @@ class MixWindowController(object):
                 pass
 
             if commit:
-                old_name = mix.mix_name
-                new_name = text_val or u'(unnamed mix)'
+                old_name = _to_unicode(mix.mix_name).strip()
+                new_name = _to_unicode(text_val).strip() or u'(unnamed mix)'
+
+                logical_name = _normalise_mix_name(new_name)
+                collision = None
+                for other_mix in self.mixes:
+                    if other_mix is mix:
+                        continue
+                    if _normalise_mix_name(other_mix.mix_name) == logical_name:
+                        collision = other_mix
+                        break
+                if collision is not None:
+                    tb.Text = mix.mix_name
+                    forms.alert(
+                        'A planting mix named "{0}" already exists.\n'
+                        'Mix names must be unique.'.format(new_name))
+                    return
 
                 if old_name != new_name:
-                    self._record_mix_rename(old_name, new_name)
+                    self._record_mix_rename(mix, old_name, new_name)
 
                 mix.mix_name = new_name
+                effective_color = _get_effective_mix_color(mix)
+                if effective_color is not None:
+                    mix.area_color_dbcolor = effective_color
                 tb.Text = mix.mix_name
                 mix.dirty = True
 
@@ -2707,11 +3511,9 @@ class MixWindowController(object):
             )
             return
 
-        curr_dbcol = getattr(mix, 'area_color_new_dbcolor', None)
-        if curr_dbcol is None:
-            curr_dbcol = getattr(mix, 'area_color_dbcolor', None)
+        curr_dbcol = _get_effective_mix_color(mix)
 
-        new_dbcol = pick_area_color_with_palette(curr_dbcol)
+        new_dbcol = pick_area_color_with_palette(curr_dbcol, self.window)
         if new_dbcol is None:
             return
 
@@ -2743,20 +3545,26 @@ class MixWindowController(object):
             uiapp = None
         view = doc.ActiveView
 
-        # Bind callback dependencies as default arguments. pyRevit can tear
-        # down this command module's globals before DrawArea.py receives the
-        # later Idling callback, so reopening must load a fresh copy of this
-        # script module instead of reusing the old MixWindowController class
-        # whose methods depend on globals such as DB, forms, and XamlReader.
-        def _close_editor(window=self.window):
+        # Bind stable callbacks for DrawArea.py. Reopen through one stable
+        # module name to avoid accumulating a new script.py module on every
+        # Draw Area run.
+        close_state = {'closed': False}
+
+        def _close_editor(window=self.window, state=close_state):
+            if state.get('closed'):
+                return
+            state['closed'] = True
             try:
                 if window is not None:
                     window.Close()
             except Exception:
                 pass
 
-        def _reopen_editor(reopen_doc, script_path=os.path.join(SCRIPT_DIR, 'script.py'), loader=imp.load_source):
-            reopened = loader('mix_schedule_editor_reopen', script_path)
+        def _reopen_editor(reopen_doc, script_path=os.path.join(SCRIPT_DIR, 'script.py')):
+            module_name = 'mix_schedule_editor_reopen'
+            reopened = sys.modules.get(module_name)
+            if reopened is None or not hasattr(reopened, 'open_mix_editor'):
+                reopened = imp.load_source(module_name, script_path)
             reopened.open_mix_editor(reopen_doc)
 
         try:
@@ -2925,7 +3733,7 @@ class MixWindowController(object):
                 self._update_mix_percent_summary(mix)
                 self._update_approx_numbers_for_mix(mix)
             return
-        display = pct_raw_to_display(raw)
+        display = pct_family_raw_to_display(raw)
         if 0 <= row_index < len(mix.rows):
             mix.rows[row_index].pct = display
         if display != text:
@@ -3063,22 +3871,69 @@ class MixWindowController(object):
         # ------------------------------------------------------------
         # 2. Call the plant picker in 'mix mode', passing context
         # ------------------------------------------------------------
+        target_view = self._get_target_view()
+        target_view_id = u''
+        target_view_name = u''
+        if target_view is not None:
+            try:
+                target_view_id = _get_element_id_int(target_view.Id)
+            except Exception:
+                target_view_id = u''
+            try:
+                target_view_name = target_view.Name
+            except Exception:
+                target_view_name = u''
+
+        mix_context = {
+            'mix_name': mix.mix_name,
+            'mix_element_id': _get_element_id_int(mix.element.Id),
+            'mix_unique_id': getattr(mix.element, 'UniqueId', u''),
+            'mix_family_name': FAMILY_NAME,
+            'target_view_id': target_view_id,
+            'target_view_name': target_view_name,
+            'current_species_count': len(mix.rows),
+            'max_species': MAX_SPECIES,
+            'max_slots': slots_left,
+            'current_total_percent': current_total_percent,
+            'percent_remaining': percent_remaining,
+            'most_common_grade': most_common_grade,
+        }
+        LOGGER.info(
+            'MIX LIBRARY: opening for mix "{0}"; species={1}; max_slots={2}; percent_remaining={3}'
+            .format(mix.mix_name, len(mix.rows), slots_left, percent_remaining)
+        )
+
         try:
             selected = plant_library.open_plant_library_dialog_for_mix(
                 max_slots=slots_left,
                 percent_remaining=percent_remaining,
                 current_total_percent=current_total_percent,
-                most_common_grade=most_common_grade
+                most_common_grade=most_common_grade,
+                mix_context=mix_context
             )
         except TypeError:
-            # Fallback if the other script still has the old signature
-            selected = plant_library.open_plant_library_dialog_for_mix()
+            try:
+                selected = plant_library.open_plant_library_dialog_for_mix(
+                    max_slots=slots_left,
+                    percent_remaining=percent_remaining,
+                    current_total_percent=current_total_percent,
+                    most_common_grade=most_common_grade
+                )
+            except TypeError:
+                # Fallback if the other script still has the old signature
+                selected = plant_library.open_plant_library_dialog_for_mix()
         except Exception as ex:
             forms.alert(
                 u"Error while running plant library dialog:\n{0}".format(ex),
                 title="Add Plant (library)"
             )
             return
+
+        selected_count = len(selected) if selected else 0
+        LOGGER.info(
+            'MIX LIBRARY: returned {0} selected plants for mix "{1}".'
+            .format(selected_count, mix.mix_name)
+        )
 
         # If user cancelled or nothing selected, do nothing
         if not selected:
@@ -3103,6 +3958,7 @@ class MixWindowController(object):
             botanical = _to_unicode(row_data.get('Botanical', u''))
             common    = _to_unicode(row_data.get('Common', u''))
             percent   = row_data.get('Percent', None)
+            spacing   = row_data.get('Spacing', None)
             grade     = row_data.get('Grade', None)
             is_groundcover = row_data.get('IsGroundcover', None)
             is_tree = row_data.get('IsTree', None)
@@ -3118,8 +3974,17 @@ class MixWindowController(object):
             else:
                 row.is_groundcover = True
 
-            # Spacing from SpreadMM (mm) -> display string (e.g. '3m')
-            if spread_mm not in (None, u''):
+            # Project mix palette values win over library spread-derived defaults.
+            if spacing not in (None, u'', ''):
+                spacing_text = _to_unicode(spacing).strip()
+                try:
+                    if u'm' in spacing_text.lower():
+                        row.spacing = space_raw_to_display(space_display_to_raw(spacing_text))
+                    else:
+                        row.spacing = space_raw_to_display(spacing_text)
+                except Exception:
+                    row.spacing = spacing_text
+            elif spread_mm not in (None, u'', ''):
                 try:
                     raw_mm_str = _to_unicode(spread_mm)
                     row.spacing = space_raw_to_display(raw_mm_str)
@@ -3128,14 +3993,15 @@ class MixWindowController(object):
             else:
                 row.spacing = u''
 
-            # Percent – convert whatever we get ('50', 50, 0.5, '50%')
-            if percent not in (None, u''):
+            # Percent – previous project mix palette values are retained exactly;
+            # otherwise use the standard new-plant default of 10%.
+            if percent not in (None, u'', ''):
                 try:
-                    row.pct = pct_raw_to_display(percent)
+                    row.pct = pct_raw_to_display(percent, assume_internal_decimal=False)
                 except Exception:
-                    row.pct = u''
+                    row.pct = _to_unicode(percent)
             else:
-                row.pct = u''
+                row.pct = u'10%'
 
             # Grade – already a display string
             if grade not in (None, u''):
@@ -3143,7 +4009,8 @@ class MixWindowController(object):
             else:
                 row.grade = u''
 
-        # 4. Rebuild the UI and refresh the header percent summary
+        # 4. Sort, rebuild the UI and refresh the header percent summary
+        _sort_mix_rows_alphabetically(mix)
         self._render_mix_body(mix)
         self._update_mix_percent_summary(mix)
         self._update_approx_numbers_for_mix(mix)
@@ -3316,19 +4183,66 @@ class MixWindowController(object):
         except Exception:
             pass
 
-    def _apply_color_scheme_color_updates(self):
-        """Push any pending Area colour updates back into the Color Fill Scheme."""
+    def _snapshot_pending_color_renames(self):
+        """Snapshot source entries before Area names change scheme usage state."""
         scheme = self._color_scheme
         if scheme is None:
             return
+        try:
+            entries = list(scheme.GetEntries())
+        except Exception:
+            entries = []
+        for record in self._area_renames:
+            source = _find_color_entry(entries, record.get('original_name'))
+            data = _snapshot_color_entry(source)
+            record['source_entry_data'] = data
+            mix = record.get('mix')
+            effective = _get_effective_mix_color(mix)
+            if effective is not None:
+                record['source_color'] = effective
+            elif data and data.get('color') is not None:
+                record['source_color'] = data.get('color')
 
-        mixes_with_new = []
+    def _pending_rename_names_are_unique(self):
+        for record in self._area_renames:
+            mix = record.get('mix')
+            wanted = _normalise_mix_name(record.get('current_name'))
+            for other_mix in self.mixes:
+                if other_mix is not mix and _normalise_mix_name(other_mix.mix_name) == wanted:
+                    forms.alert(
+                        'A planting mix named "{0}" already exists.\n'
+                        'Mix names must be unique.'.format(
+                            record.get('current_name', u'')))
+                    return False
+        return True
+
+    def _old_mix_name_is_still_used(self, old_name, renamed_mix):
+        wanted = _normalise_mix_name(old_name)
         for mix in self.mixes:
-            if getattr(mix, 'area_color_entry', None) is not None                     and getattr(mix, 'area_color_new_dbcolor', None) is not None:
-                mixes_with_new.append(mix)
+            if mix is not renamed_mix and _normalise_mix_name(mix.mix_name) == wanted:
+                return True
+        try:
+            areas = (DB.FilteredElementCollector(self.doc)
+                     .OfCategory(DB.BuiltInCategory.OST_Areas)
+                     .WhereElementIsNotElementType())
+        except Exception:
+            areas = []
+        for area in areas:
+            if _normalise_mix_name(get_param(area, AREA_NAME_PARAM)) == wanted:
+                return True
+        return False
 
-        if not mixes_with_new:
-            return
+    def _apply_color_scheme_color_updates(self):
+        """Apply ordinary edits and rename migrations in one SetEntries call."""
+        scheme = self._color_scheme
+        if scheme is None:
+            return []
+
+        has_pending = bool(self._area_renames)
+        has_colors = any(getattr(mix, 'area_color_new_dbcolor', None) is not None
+                         for mix in self.mixes)
+        if not has_pending and not has_colors:
+            return []
 
         try:
             entries = list(scheme.GetEntries())
@@ -3338,33 +4252,97 @@ class MixWindowController(object):
             except Exception:
                 entries = []
 
-        if not entries:
-            return
+        if not entries and not has_pending:
+            return []
 
         changed = False
+        applied_mixes = []
 
-        for mix in mixes_with_new:
-            target_val, target_cap = _get_color_entry_keys(mix.area_color_entry)
-            new_col = mix.area_color_new_dbcolor
+        for record in self._area_renames:
+            mix = record.get('mix')
+            old_name = record.get('original_name', u'')
+            new_name = record.get('current_name', u'')
+            source = _find_color_entry(entries, old_name)
+            target = _find_color_entry(entries, new_name)
+            source_data = record.get('source_entry_data') or _snapshot_color_entry(source)
+            color = _get_effective_mix_color(mix) or record.get('source_color')
+            removed_old = False
 
-            for e in entries:
-                v_key, c_key = _get_color_entry_keys(e)
-
-                if (target_val and v_key == target_val) or                    (not target_val and target_cap and c_key == target_cap) or                    (target_cap and c_key == target_cap):
-                    try:
-                        e.Color = new_col
+            if target is source and target is not None:
+                try:
+                    if target.StorageType == DB.StorageType.String:
+                        target.SetStringValue(new_name)
                         changed = True
-                        mix.area_color_dbcolor = new_col
-                        mix.area_color_new_dbcolor = None
-                    except Exception:
-                        pass
-                    break
+                except Exception as ex:
+                    raise Exception(
+                        'Could not update case of colour-scheme entry "{0}": {1}'
+                        .format(old_name, ex))
+            elif target is None and (source is not None or color is not None):
+                try:
+                    target = DB.ColorFillSchemeEntry(DB.StorageType.String)
+                    target.SetStringValue(new_name)
+                    entries.append(target)
+                    changed = True
+                except Exception as ex:
+                    raise Exception(
+                        'Could not create colour-scheme entry for "{0}": {1}'
+                        .format(new_name, ex))
+
+            if target is not None:
+                _copy_color_entry_graphics(source_data, target, new_name, color)
+                changed = True
+                if mix not in applied_mixes:
+                    applied_mixes.append(mix)
+
+            if (source is not None and source is not target and
+                    not self._old_mix_name_is_still_used(old_name, mix)):
+                try:
+                    entries.remove(source)
+                    removed_old = True
+                    changed = True
+                except ValueError:
+                    pass
+
+            LOGGER.info(
+                'Rename colour migration: "{0}" -> "{1}"; source colour: {2}; '
+                'target scheme entry: {3}; areas renamed: {4}; old entry removed: {5}'
+                .format(old_name, new_name, _format_dbcolor(color),
+                        'updated' if target is not None else 'not available',
+                        record.get('areas_renamed', 0),
+                        'yes' if removed_old else 'no'))
+
+        for mix in self.mixes:
+            new_col = getattr(mix, 'area_color_new_dbcolor', None)
+            if new_col is None:
+                continue
+            target = _find_color_entry(entries, mix.mix_name)
+            if target is not None:
+                try:
+                    _set_entry_color(target, new_col)
+                    changed = True
+                    if mix not in applied_mixes:
+                        applied_mixes.append(mix)
+                except Exception:
+                    pass
 
         if changed:
             try:
+                validator = getattr(scheme, 'AreEntriesConsistentWithScheme', None)
+                if validator is not None:
+                    consistency = validator(entries)
+                    if not _is_color_scheme_entries_consistent(consistency):
+                        raise Exception(
+                            'Color scheme rejected the migrated entry collection: {0}'
+                            .format(
+                                _get_color_scheme_consistency_text(consistency)))
                 scheme.SetEntries(entries)
-            except Exception:
-                LOGGER.warning('Failed to SetEntries on ColorFillScheme for updated colours.')
+            except Exception as ex:
+                LOGGER.warning(
+                    'Failed to migrate ColorFillScheme entries; pending rename colours '
+                    'were retained: {0}'.format(ex))
+                raise
+
+        return applied_mixes
 
     def _update_filled_region_strips(self):
         """Ensure each mix has a FilledRegionType + strip matching its Area colour."""
@@ -3377,10 +4355,31 @@ class MixWindowController(object):
             except Exception:
                 host_view = None
 
+        for record in self._area_renames:
+            mix = record.get('mix')
+            color = _get_effective_mix_color(mix) or record.get('source_color')
+            try:
+                result = _migrate_filled_region_for_rename(
+                    doc,
+                    record.get('original_name'),
+                    record.get('current_name'),
+                    color,
+                    host_view)
+                LOGGER.info(
+                    'Rename colour migration: "{0}" -> "{1}"; FilledRegionType: '
+                    '{2}; instances retyped: {3}; old type removed: {4}'
+                    .format(record.get('original_name'), record.get('current_name'),
+                            result.get('status'), result.get('retyped'),
+                            'yes' if result.get('old_type_removed') else 'no'))
+            except Exception as ex:
+                LOGGER.warning(
+                    'Rename colour migration: FilledRegion migration failed for '
+                    '"{0}" -> "{1}": {2}'
+                    .format(record.get('original_name'), record.get('current_name'), ex))
+                raise
+
         for mix in self.mixes:
-            col = getattr(mix, 'area_color_new_dbcolor', None)
-            if col is None:
-                col = getattr(mix, 'area_color_dbcolor', None)
+            col = _get_effective_mix_color(mix)
 
             if col is None:
                 fr_debug(
@@ -3413,11 +4412,16 @@ class MixWindowController(object):
     def on_apply(self, sender, args):
         if not self.mixes:
             return
+        if not self._pending_rename_names_are_unique():
+            return
 
         t = DB.Transaction(self.doc, 'Update Mix Schedules')
+        color_applied_mixes = []
         try:
             t.Start()
+            self._snapshot_pending_color_renames()
             for mix in self.mixes:
+                _sort_mix_rows_alphabetically(mix)
                 num = len(mix.rows)
                 if num > MAX_SPECIES:
                     num = MAX_SPECIES
@@ -3439,7 +4443,7 @@ class MixWindowController(object):
 
                         code_val = row.code or u''
 
-                        pct_raw = pct_display_to_raw(row.pct)
+                        pct_raw = pct_user_display_to_family_raw(row.pct)
                         pct_val = pct_raw if pct_raw not in (None, u'') else u''
 
                         space_raw_mm = space_display_to_raw(row.spacing)
@@ -3483,9 +4487,11 @@ class MixWindowController(object):
                         set_param(mix.element, space_name, space_mm)
 
             if self._area_renames:
-                for (old_name, new_name) in self._area_renames:
-                    old_name = _to_unicode(old_name).strip()
-                    new_name = _to_unicode(new_name).strip()
+                for rename_record in self._area_renames:
+                    old_name = _to_unicode(
+                        rename_record.get('original_name')).strip()
+                    new_name = _to_unicode(
+                        rename_record.get('current_name')).strip()
                     if not old_name or not new_name or old_name == new_name:
                         continue
 
@@ -3495,28 +4501,66 @@ class MixWindowController(object):
 
                     for area in areas:
                         nm = get_param(area, AREA_NAME_PARAM)
-                        if nm and _to_unicode(nm).strip() == old_name:
+                        if nm and _normalise_mix_name(nm) == _normalise_mix_name(old_name):
                             set_param(area, AREA_NAME_PARAM, new_name)
+                            rename_record['areas_renamed'] = (
+                                rename_record.get('areas_renamed', 0) + 1)
 
-                self._area_renames = []
+            self.doc.Regenerate()
 
-            self._apply_color_scheme_color_updates()
+            color_applied_mixes = self._apply_color_scheme_color_updates()
             self._update_filled_region_strips()
 
             t.Commit()
-            self._area_totals_by_mix_key = self._load_area_totals_by_mix_name()
-            self._update_all_approx_numbers()
-            # After committing, show a debug popup with everything we logged
-            show_fr_debug_popup()
-
 
         except Exception as ex:
             try:
-                t.RollBack()
+                should_rollback = True
+                try:
+                    should_rollback = t.HasStarted() and not t.HasEnded()
+                except Exception:
+                    pass
+                if should_rollback:
+                    t.RollBack()
             except Exception:
                 pass
             forms.alert('Failed to update mix schedules:\n{0}'.format(ex))
             return
+
+        # Clear pending identity/colour state only after the coordinated
+        # transaction has committed successfully.
+        completed_renames = list(self._area_renames)
+        self._area_renames = []
+        for record in completed_renames:
+            mix = record.get('mix')
+            if mix is not None:
+                mix.pending_rename = None
+        for mix in color_applied_mixes:
+            color = _get_effective_mix_color(mix)
+            if color is not None:
+                mix.area_color_dbcolor = color
+            mix.area_color_new_dbcolor = None
+
+        try:
+            self._load_color_scheme()
+            for mix in self.mixes:
+                self._attach_color_to_mix(mix)
+            self._refresh_stack_panel()
+        except Exception as ex:
+            LOGGER.warning(
+                'Rename colour migration committed, but editor colour links could '
+                'not be refreshed: {0}'.format(ex))
+
+        try:
+            target_view_for_log = self._get_target_view()
+            _append_mix_usage_log_rows(self.doc, self.mixes, target_view_for_log, self._mix_log_session_id)
+        except Exception as log_ex:
+            LOGGER.warning('MIX LOGS: failed after Apply: {0}'.format(log_ex))
+
+        self._area_totals_by_mix_key = self._load_area_totals_by_mix_name()
+        self._update_all_approx_numbers()
+        # After committing, show a debug popup with everything we logged
+        show_fr_debug_popup()
 
         LOGGER.info(
             'Mix schedules, related Areas, Area names, Area colours, '
