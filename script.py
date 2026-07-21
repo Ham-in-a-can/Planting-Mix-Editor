@@ -937,6 +937,45 @@ def _copy_color_entry_graphics(source_data, target_entry, target_name, color):
     _set_entry_color(target_entry, color or (source_data or {}).get('color'))
 
 
+def _get_color_scheme_consistency_text(result):
+    """Return the most useful available description of a Revit consistency enum."""
+    try:
+        return _to_unicode(result.ToString())
+    except Exception:
+        pass
+    try:
+        return _to_unicode(result)
+    except Exception:
+        pass
+    try:
+        return _to_unicode(int(result))
+    except Exception:
+        return u'<unknown>'
+
+
+def _is_color_scheme_entries_consistent(result):
+    """Explicitly interpret EntryAndSchemeConsistency; Consistent is zero."""
+    consistent_value = None
+    try:
+        consistent_value = DB.EntryAndSchemeConsistency.Consistent
+    except Exception:
+        pass
+
+    if consistent_value is not None:
+        try:
+            return result == consistent_value
+        except Exception:
+            return False
+
+    try:
+        return int(result) == 0
+    except Exception:
+        pass
+
+    return (_get_color_scheme_consistency_text(result).strip().lower() ==
+            u'consistent')
+
+
 def _dbcolor_to_media_brush(db_color):
     """Convert Revit.DB.Color to a WPF SolidColorBrush for UI preview."""
     try:
@@ -4289,8 +4328,13 @@ class MixWindowController(object):
         if changed:
             try:
                 validator = getattr(scheme, 'AreEntriesConsistentWithScheme', None)
-                if validator is not None and not validator(entries):
-                    raise Exception('Color scheme rejected the migrated entry collection.')
+                if validator is not None:
+                    consistency = validator(entries)
+                    if not _is_color_scheme_entries_consistent(consistency):
+                        raise Exception(
+                            'Color scheme rejected the migrated entry collection: {0}'
+                            .format(
+                                _get_color_scheme_consistency_text(consistency)))
                 scheme.SetEntries(entries)
             except Exception as ex:
                 LOGGER.warning(
