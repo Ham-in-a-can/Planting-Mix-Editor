@@ -856,6 +856,87 @@ def _get_color_entry_keys(entry):
     return val_key, cap_key
 
 
+def _normalise_mix_name(name):
+    return _to_unicode(name).strip().lower()
+
+
+def _get_effective_mix_color(mix):
+    """Return the colour that represents the mix for the current edit session."""
+    if mix is None:
+        return None
+    color = getattr(mix, 'area_color_new_dbcolor', None)
+    if color is not None:
+        return color
+    rename = getattr(mix, 'pending_rename', None)
+    if rename:
+        color = rename.get('source_color')
+        if color is not None:
+            return color
+    color = getattr(mix, 'area_color_dbcolor', None)
+    if color is not None:
+        return color
+    return _get_entry_color(getattr(mix, 'area_color_entry', None))
+
+
+def _format_dbcolor(color):
+    if color is None:
+        return u'<none>'
+    try:
+        return u'RGB({0},{1},{2})'.format(color.Red, color.Green, color.Blue)
+    except Exception:
+        return u'<invalid>'
+
+
+def _find_color_entry(entries, name):
+    wanted = _normalise_mix_name(name)
+    if not wanted:
+        return None
+    for entry in entries or []:
+        value, caption = _get_color_entry_keys(entry)
+        if (_normalise_mix_name(value) == wanted or
+                _normalise_mix_name(caption) == wanted):
+            return entry
+    return None
+
+
+def _snapshot_color_entry(entry):
+    """Copy writable scheme-entry graphics without retaining the entry object."""
+    if entry is None:
+        return None
+    value, caption = _get_color_entry_keys(entry)
+    data = {
+        'value': value,
+        'caption': caption,
+        'color': _get_entry_color(entry),
+    }
+    for attr in ('FillPatternId', 'IsVisible'):
+        try:
+            data[attr] = getattr(entry, attr)
+        except Exception:
+            pass
+    return data
+
+
+def _copy_color_entry_graphics(source_data, target_entry, target_name, color):
+    if target_entry is None:
+        return
+    if source_data:
+        for attr in ('FillPatternId', 'IsVisible'):
+            if attr in source_data:
+                try:
+                    setattr(target_entry, attr, source_data[attr])
+                except Exception:
+                    pass  # Property availability and writability varies by Revit version.
+        caption = source_data.get('caption', u'')
+        source_value = source_data.get('value', u'')
+        if caption and _normalise_mix_name(caption) != _normalise_mix_name(source_value):
+            try:
+                target_entry.Caption = caption
+            except Exception:
+                pass
+    _set_entry_color(target_entry, color or (source_data or {}).get('color'))
+
+
 def _dbcolor_to_media_brush(db_color):
     """Convert Revit.DB.Color to a WPF SolidColorBrush for UI preview."""
     try:
@@ -1078,7 +1159,7 @@ def _sanitize_mix_name_for_type(mix_name):
     base = _to_unicode(mix_name).strip()
     if not base:
         base = u'Unnamed'
-    for ch in u'<>:"/\|?*':
+    for ch in u'<>:"/\\|?*':
         base = base.replace(ch, u'_')
     return base
 
@@ -1152,6 +1233,142 @@ def _set_filled_region_type_color(fr_type, color):
                 ex
             )
         )
+
+
+def _get_filled_region_type_by_name(doc, type_name):
+    try:
+        types = DB.FilteredElementCollector(doc).OfClass(DB.FilledRegionType)
+    except Exception:
+        types = []
+    wanted = _to_unicode(type_name).strip().lower()
+    for fr_type in types:
+        try:
+            if _to_unicode(get_element_name(fr_type)).strip().lower() == wanted:
+                return fr_type
+        except Exception:
+            continue
+    return None
+
+
+def _is_mix_color_strip_region(region, host_view):
+    """Identify only the small origin rectangle created by this editor."""
+    if region is None or host_view is None:
+        return False
+    try:
+        bbox = region.get_BoundingBox(host_view)
+        if bbox is None:
+            return False
+        expected_w = FILLED_REGION_WIDTH_MM / 304.8
+        expected_h = FILLED_REGION_HEIGHT_MM / 304.8
+        tolerance = 2.0 / 304.8
+        return (abs(bbox.Min.X) <= tolerance and
+                abs(bbox.Min.Y) <= tolerance and
+                abs((bbox.Max.X - bbox.Min.X) - expected_w) <= tolerance and
+                abs((bbox.Max.Y - bbox.Min.Y) - expected_h) <= tolerance)
+    except Exception:
+        return False
+
+
+def _migrate_filled_region_for_rename(doc, old_mix_name, new_mix_name,
+                                      color, host_view):
+    """Move bm_planting strip identity to a renamed mix."""
+    result = {'status': 'not found', 'retyped': 0, 'old_type_removed': False}
+    old_type_name = u'bm_planting_{0}'.format(
+        _sanitize_mix_name_for_type(old_mix_name))
+    new_type_name = u'bm_planting_{0}'.format(
+        _sanitize_mix_name_for_type(new_mix_name))
+    old_type = _get_filled_region_type_by_name(doc, old_type_name)
+    target_type = _get_filled_region_type_by_name(doc, new_type_name)
+
+    if _normalise_mix_name(old_type_name) == _normalise_mix_name(new_type_name):
+        target_type = target_type or old_type
+        if target_type is not None:
+            _set_filled_region_type_color(target_type, color)
+            result['status'] = 'updated'
+        return result
+
+    if old_type is not None and target_type is None:
+        try:
+            duplicate_result = old_type.Duplicate(new_type_name)
+            if isinstance(duplicate_result, DB.FilledRegionType):
+                target_type = duplicate_result
+            else:
+                target_type = doc.GetElement(duplicate_result)
+            result['status'] = 'duplicated from source'
+        except Exception as ex:
+            LOGGER.warning(
+                'Rename colour migration: could not duplicate FilledRegionType '
+                '"{0}" as "{1}": {2}'.format(old_type_name, new_type_name, ex))
+
+    if target_type is not None:
+        _set_filled_region_type_color(target_type, color)
+
+    if old_type is not None and target_type is not None:
+        try:
+            regions = DB.FilteredElementCollector(doc).OfClass(DB.FilledRegion)
+        except Exception:
+            regions = []
+        for region in regions:
+            try:
+                if (_get_element_id_int(region.GetTypeId()) ==
+                        _get_element_id_int(old_type.Id)):
+                    region.ChangeTypeId(target_type.Id)
+                    result['retyped'] += 1
+            except Exception as ex:
+                LOGGER.warning(
+                    'Rename colour migration: could not retype FilledRegion {0}: {1}'
+                    .format(_get_element_id_int(region.Id), ex))
+
+        still_used = False
+        try:
+            regions = DB.FilteredElementCollector(doc).OfClass(DB.FilledRegion)
+        except Exception:
+            regions = []
+        for region in regions:
+            try:
+                if (_get_element_id_int(region.GetTypeId()) ==
+                        _get_element_id_int(old_type.Id)):
+                    still_used = True
+                    break
+            except Exception:
+                continue
+        if not still_used:
+            try:
+                doc.Delete(old_type.Id)
+                result['old_type_removed'] = True
+            except Exception:
+                pass  # The type can be protected or referenced outside visible strips.
+
+        # A pre-existing target strip plus a retyped source strip can otherwise
+        # leave two editor-created rectangles at the origin. Never delete other
+        # FilledRegions merely because they use the same type.
+        if host_view is not None:
+            try:
+                view_regions = (DB.FilteredElementCollector(doc, host_view.Id)
+                                .OfClass(DB.FilledRegion))
+            except Exception:
+                view_regions = []
+            strip_regions = []
+            for region in view_regions:
+                try:
+                    if (_get_element_id_int(region.GetTypeId()) ==
+                            _get_element_id_int(target_type.Id) and
+                            _is_mix_color_strip_region(region, host_view)):
+                        strip_regions.append(region)
+                except Exception:
+                    continue
+            for duplicate in strip_regions[1:]:
+                try:
+                    doc.Delete(duplicate.Id)
+                except Exception:
+                    pass  # Preserve workflow if an individual strip cannot be deleted.
+
+    if target_type is None and color is not None:
+        _ensure_filled_region_for_mix(doc, new_mix_name, color, host_view)
+        result['status'] = 'created from template'
+    elif target_type is not None and result['status'] == 'not found':
+        result['status'] = 'updated target'
+    return result
 
 
 
@@ -1577,6 +1794,7 @@ class MixModel(object):
         self.area_color_dbcolor = None        # Original Revit.DB.Color from scheme
         self.area_color_new_dbcolor = None    # Pending new color to push on Apply
         self.area_color_border = None         # WPF Border used for colour swatch UI
+        self.pending_rename = None             # Identity migration retained until Apply commits
         self.groundcover_icon = _load_bitmap_image(GROUNDCOVER_ICON_PATH)
         self.tree_icon = _load_bitmap_image(TREE_ICON_PATH)
 
@@ -1735,7 +1953,7 @@ class MixWindowController(object):
         self._last_header_mix = None
         self._last_header_click_time = None
 
-        # Pending Area renames: list of (old_name, new_name)
+        # Pending identity migrations. Records are also attached to each MixModel.
         self._area_renames = []
 
         # Ghost Area + boundary for seeding names
@@ -1937,13 +2155,15 @@ class MixWindowController(object):
                 except Exception:
                     continue
 
+        pending_color = _get_effective_mix_color(mix)
         mix.area_color_entry = entry
-        mix.area_color_new_dbcolor = None
 
         if entry is not None:
             mix.area_color_dbcolor = _get_entry_color(entry)
-        else:
+        elif pending_color is None:
             mix.area_color_dbcolor = None
+        elif getattr(mix, 'area_color_dbcolor', None) is None:
+            mix.area_color_dbcolor = pending_color
 
     def _get_mix_symbol(self):
         """Find and cache the FamilySymbol for the bm_massed_mix generic annotation."""
@@ -2186,13 +2406,46 @@ class MixWindowController(object):
         for mix in self.mixes:
             self._update_approx_numbers_for_mix(mix)
 
-    def _record_mix_rename(self, old_name, new_name):
-        """Record that a mix name changed; will be applied to Areas on Apply."""
+    def _record_mix_rename(self, mix, old_name, new_name):
+        """Record one identity-preserving rename, collapsing chained edits."""
         old_name = _to_unicode(old_name).strip()
         new_name = _to_unicode(new_name).strip()
-        if not old_name or not new_name or old_name == new_name:
+        if not old_name or not new_name:
             return
-        self._area_renames.append((old_name, new_name))
+
+        record = getattr(mix, 'pending_rename', None)
+        if record is None:
+            entry_value, entry_caption = _get_color_entry_keys(
+                getattr(mix, 'area_color_entry', None))
+            record = {
+                'mix': mix,
+                'original_name': old_name,
+                'current_name': new_name,
+                'source_color': _get_effective_mix_color(mix),
+                'source_entry_value': entry_value or None,
+                'source_entry_caption': entry_caption or None,
+                'source_filled_region_type_name': u'bm_planting_{0}'.format(
+                    _sanitize_mix_name_for_type(old_name)),
+                'target_filled_region_type_name': u'bm_planting_{0}'.format(
+                    _sanitize_mix_name_for_type(new_name)),
+                'source_entry_data': None,
+                'areas_renamed': 0,
+            }
+            mix.pending_rename = record
+            self._area_renames.append(record)
+        else:
+            record['current_name'] = new_name
+            record['target_filled_region_type_name'] = u'bm_planting_{0}'.format(
+                _sanitize_mix_name_for_type(new_name))
+            if record.get('source_color') is None:
+                record['source_color'] = _get_effective_mix_color(mix)
+
+        if (record['original_name'].strip() == record['current_name'].strip()):
+            try:
+                self._area_renames.remove(record)
+            except ValueError:
+                pass
+            mix.pending_rename = None
 
     def _generate_copy_name(self, base_name):
         """Generate a unique 'base_name Copy' or 'base_name Copy X' name."""
@@ -2551,10 +2804,7 @@ class MixWindowController(object):
         swatch.Margin = Thickness(0, 0, 0, 0)
         swatch.HorizontalAlignment = HorizontalAlignment.Left
 
-        if mix.area_color_new_dbcolor is not None:
-            brush = _dbcolor_to_media_brush(mix.area_color_new_dbcolor)
-        else:
-            brush = _dbcolor_to_media_brush(mix.area_color_dbcolor)
+        brush = _dbcolor_to_media_brush(_get_effective_mix_color(mix))
         swatch.Background = brush
 
         # If no Area exists for this mix, show "Not Placed" in the swatch
@@ -3043,6 +3293,7 @@ class MixWindowController(object):
         edit_box.FontSize = tb.FontSize
         edit_box.Foreground = tb.Foreground
         edit_box.Tag = mix
+        edit_state = {'finished': False}
 
         if idx >= 0:
             header_stack.Children.Insert(idx, edit_box)
@@ -3050,6 +3301,9 @@ class MixWindowController(object):
             header_stack.Children.Add(edit_box)
 
         def finish_edit(sender, commit):
+            if edit_state['finished']:
+                return
+            edit_state['finished'] = True
             try:
                 text_val = sender.Text or u''
             except Exception:
@@ -3068,13 +3322,31 @@ class MixWindowController(object):
                 pass
 
             if commit:
-                old_name = mix.mix_name
-                new_name = text_val or u'(unnamed mix)'
+                old_name = _to_unicode(mix.mix_name).strip()
+                new_name = _to_unicode(text_val).strip() or u'(unnamed mix)'
+
+                logical_name = _normalise_mix_name(new_name)
+                collision = None
+                for other_mix in self.mixes:
+                    if other_mix is mix:
+                        continue
+                    if _normalise_mix_name(other_mix.mix_name) == logical_name:
+                        collision = other_mix
+                        break
+                if collision is not None:
+                    tb.Text = mix.mix_name
+                    forms.alert(
+                        'A planting mix named "{0}" already exists.\n'
+                        'Mix names must be unique.'.format(new_name))
+                    return
 
                 if old_name != new_name:
-                    self._record_mix_rename(old_name, new_name)
+                    self._record_mix_rename(mix, old_name, new_name)
 
                 mix.mix_name = new_name
+                effective_color = _get_effective_mix_color(mix)
+                if effective_color is not None:
+                    mix.area_color_dbcolor = effective_color
                 tb.Text = mix.mix_name
                 mix.dirty = True
 
@@ -3200,9 +3472,7 @@ class MixWindowController(object):
             )
             return
 
-        curr_dbcol = getattr(mix, 'area_color_new_dbcolor', None)
-        if curr_dbcol is None:
-            curr_dbcol = getattr(mix, 'area_color_dbcolor', None)
+        curr_dbcol = _get_effective_mix_color(mix)
 
         new_dbcol = pick_area_color_with_palette(curr_dbcol, self.window)
         if new_dbcol is None:
@@ -3874,19 +4144,66 @@ class MixWindowController(object):
         except Exception:
             pass
 
-    def _apply_color_scheme_color_updates(self):
-        """Push any pending Area colour updates back into the Color Fill Scheme."""
+    def _snapshot_pending_color_renames(self):
+        """Snapshot source entries before Area names change scheme usage state."""
         scheme = self._color_scheme
         if scheme is None:
             return
+        try:
+            entries = list(scheme.GetEntries())
+        except Exception:
+            entries = []
+        for record in self._area_renames:
+            source = _find_color_entry(entries, record.get('original_name'))
+            data = _snapshot_color_entry(source)
+            record['source_entry_data'] = data
+            mix = record.get('mix')
+            effective = _get_effective_mix_color(mix)
+            if effective is not None:
+                record['source_color'] = effective
+            elif data and data.get('color') is not None:
+                record['source_color'] = data.get('color')
 
-        mixes_with_new = []
+    def _pending_rename_names_are_unique(self):
+        for record in self._area_renames:
+            mix = record.get('mix')
+            wanted = _normalise_mix_name(record.get('current_name'))
+            for other_mix in self.mixes:
+                if other_mix is not mix and _normalise_mix_name(other_mix.mix_name) == wanted:
+                    forms.alert(
+                        'A planting mix named "{0}" already exists.\n'
+                        'Mix names must be unique.'.format(
+                            record.get('current_name', u'')))
+                    return False
+        return True
+
+    def _old_mix_name_is_still_used(self, old_name, renamed_mix):
+        wanted = _normalise_mix_name(old_name)
         for mix in self.mixes:
-            if getattr(mix, 'area_color_entry', None) is not None                     and getattr(mix, 'area_color_new_dbcolor', None) is not None:
-                mixes_with_new.append(mix)
+            if mix is not renamed_mix and _normalise_mix_name(mix.mix_name) == wanted:
+                return True
+        try:
+            areas = (DB.FilteredElementCollector(self.doc)
+                     .OfCategory(DB.BuiltInCategory.OST_Areas)
+                     .WhereElementIsNotElementType())
+        except Exception:
+            areas = []
+        for area in areas:
+            if _normalise_mix_name(get_param(area, AREA_NAME_PARAM)) == wanted:
+                return True
+        return False
 
-        if not mixes_with_new:
-            return
+    def _apply_color_scheme_color_updates(self):
+        """Apply ordinary edits and rename migrations in one SetEntries call."""
+        scheme = self._color_scheme
+        if scheme is None:
+            return []
+
+        has_pending = bool(self._area_renames)
+        has_colors = any(getattr(mix, 'area_color_new_dbcolor', None) is not None
+                         for mix in self.mixes)
+        if not has_pending and not has_colors:
+            return []
 
         try:
             entries = list(scheme.GetEntries())
@@ -3896,33 +4213,92 @@ class MixWindowController(object):
             except Exception:
                 entries = []
 
-        if not entries:
-            return
+        if not entries and not has_pending:
+            return []
 
         changed = False
+        applied_mixes = []
 
-        for mix in mixes_with_new:
-            target_val, target_cap = _get_color_entry_keys(mix.area_color_entry)
-            new_col = mix.area_color_new_dbcolor
+        for record in self._area_renames:
+            mix = record.get('mix')
+            old_name = record.get('original_name', u'')
+            new_name = record.get('current_name', u'')
+            source = _find_color_entry(entries, old_name)
+            target = _find_color_entry(entries, new_name)
+            source_data = record.get('source_entry_data') or _snapshot_color_entry(source)
+            color = _get_effective_mix_color(mix) or record.get('source_color')
+            removed_old = False
 
-            for e in entries:
-                v_key, c_key = _get_color_entry_keys(e)
-
-                if (target_val and v_key == target_val) or                    (not target_val and target_cap and c_key == target_cap) or                    (target_cap and c_key == target_cap):
-                    try:
-                        e.Color = new_col
+            if target is source and target is not None:
+                try:
+                    if target.StorageType == DB.StorageType.String:
+                        target.SetStringValue(new_name)
                         changed = True
-                        mix.area_color_dbcolor = new_col
-                        mix.area_color_new_dbcolor = None
-                    except Exception:
-                        pass
-                    break
+                except Exception as ex:
+                    raise Exception(
+                        'Could not update case of colour-scheme entry "{0}": {1}'
+                        .format(old_name, ex))
+            elif target is None and (source is not None or color is not None):
+                try:
+                    target = DB.ColorFillSchemeEntry(DB.StorageType.String)
+                    target.SetStringValue(new_name)
+                    entries.append(target)
+                    changed = True
+                except Exception as ex:
+                    raise Exception(
+                        'Could not create colour-scheme entry for "{0}": {1}'
+                        .format(new_name, ex))
+
+            if target is not None:
+                _copy_color_entry_graphics(source_data, target, new_name, color)
+                changed = True
+                if mix not in applied_mixes:
+                    applied_mixes.append(mix)
+
+            if (source is not None and source is not target and
+                    not self._old_mix_name_is_still_used(old_name, mix)):
+                try:
+                    entries.remove(source)
+                    removed_old = True
+                    changed = True
+                except ValueError:
+                    pass
+
+            LOGGER.info(
+                'Rename colour migration: "{0}" -> "{1}"; source colour: {2}; '
+                'target scheme entry: {3}; areas renamed: {4}; old entry removed: {5}'
+                .format(old_name, new_name, _format_dbcolor(color),
+                        'updated' if target is not None else 'not available',
+                        record.get('areas_renamed', 0),
+                        'yes' if removed_old else 'no'))
+
+        for mix in self.mixes:
+            new_col = getattr(mix, 'area_color_new_dbcolor', None)
+            if new_col is None:
+                continue
+            target = _find_color_entry(entries, mix.mix_name)
+            if target is not None:
+                try:
+                    _set_entry_color(target, new_col)
+                    changed = True
+                    if mix not in applied_mixes:
+                        applied_mixes.append(mix)
+                except Exception:
+                    pass
 
         if changed:
             try:
+                validator = getattr(scheme, 'AreEntriesConsistentWithScheme', None)
+                if validator is not None and not validator(entries):
+                    raise Exception('Color scheme rejected the migrated entry collection.')
                 scheme.SetEntries(entries)
-            except Exception:
-                LOGGER.warning('Failed to SetEntries on ColorFillScheme for updated colours.')
+            except Exception as ex:
+                LOGGER.warning(
+                    'Failed to migrate ColorFillScheme entries; pending rename colours '
+                    'were retained: {0}'.format(ex))
+                raise
+
+        return applied_mixes
 
     def _update_filled_region_strips(self):
         """Ensure each mix has a FilledRegionType + strip matching its Area colour."""
@@ -3935,10 +4311,31 @@ class MixWindowController(object):
             except Exception:
                 host_view = None
 
+        for record in self._area_renames:
+            mix = record.get('mix')
+            color = _get_effective_mix_color(mix) or record.get('source_color')
+            try:
+                result = _migrate_filled_region_for_rename(
+                    doc,
+                    record.get('original_name'),
+                    record.get('current_name'),
+                    color,
+                    host_view)
+                LOGGER.info(
+                    'Rename colour migration: "{0}" -> "{1}"; FilledRegionType: '
+                    '{2}; instances retyped: {3}; old type removed: {4}'
+                    .format(record.get('original_name'), record.get('current_name'),
+                            result.get('status'), result.get('retyped'),
+                            'yes' if result.get('old_type_removed') else 'no'))
+            except Exception as ex:
+                LOGGER.warning(
+                    'Rename colour migration: FilledRegion migration failed for '
+                    '"{0}" -> "{1}": {2}'
+                    .format(record.get('original_name'), record.get('current_name'), ex))
+                raise
+
         for mix in self.mixes:
-            col = getattr(mix, 'area_color_new_dbcolor', None)
-            if col is None:
-                col = getattr(mix, 'area_color_dbcolor', None)
+            col = _get_effective_mix_color(mix)
 
             if col is None:
                 fr_debug(
@@ -3971,10 +4368,14 @@ class MixWindowController(object):
     def on_apply(self, sender, args):
         if not self.mixes:
             return
+        if not self._pending_rename_names_are_unique():
+            return
 
         t = DB.Transaction(self.doc, 'Update Mix Schedules')
+        color_applied_mixes = []
         try:
             t.Start()
+            self._snapshot_pending_color_renames()
             for mix in self.mixes:
                 _sort_mix_rows_alphabetically(mix)
                 num = len(mix.rows)
@@ -4042,9 +4443,11 @@ class MixWindowController(object):
                         set_param(mix.element, space_name, space_mm)
 
             if self._area_renames:
-                for (old_name, new_name) in self._area_renames:
-                    old_name = _to_unicode(old_name).strip()
-                    new_name = _to_unicode(new_name).strip()
+                for rename_record in self._area_renames:
+                    old_name = _to_unicode(
+                        rename_record.get('original_name')).strip()
+                    new_name = _to_unicode(
+                        rename_record.get('current_name')).strip()
                     if not old_name or not new_name or old_name == new_name:
                         continue
 
@@ -4054,12 +4457,14 @@ class MixWindowController(object):
 
                     for area in areas:
                         nm = get_param(area, AREA_NAME_PARAM)
-                        if nm and _to_unicode(nm).strip() == old_name:
+                        if nm and _normalise_mix_name(nm) == _normalise_mix_name(old_name):
                             set_param(area, AREA_NAME_PARAM, new_name)
+                            rename_record['areas_renamed'] = (
+                                rename_record.get('areas_renamed', 0) + 1)
 
-                self._area_renames = []
+            self.doc.Regenerate()
 
-            self._apply_color_scheme_color_updates()
+            color_applied_mixes = self._apply_color_scheme_color_updates()
             self._update_filled_region_strips()
 
             t.Commit()
@@ -4077,6 +4482,30 @@ class MixWindowController(object):
                 pass
             forms.alert('Failed to update mix schedules:\n{0}'.format(ex))
             return
+
+        # Clear pending identity/colour state only after the coordinated
+        # transaction has committed successfully.
+        completed_renames = list(self._area_renames)
+        self._area_renames = []
+        for record in completed_renames:
+            mix = record.get('mix')
+            if mix is not None:
+                mix.pending_rename = None
+        for mix in color_applied_mixes:
+            color = _get_effective_mix_color(mix)
+            if color is not None:
+                mix.area_color_dbcolor = color
+            mix.area_color_new_dbcolor = None
+
+        try:
+            self._load_color_scheme()
+            for mix in self.mixes:
+                self._attach_color_to_mix(mix)
+            self._refresh_stack_panel()
+        except Exception as ex:
+            LOGGER.warning(
+                'Rename colour migration committed, but editor colour links could '
+                'not be refreshed: {0}'.format(ex))
 
         try:
             target_view_for_log = self._get_target_view()
