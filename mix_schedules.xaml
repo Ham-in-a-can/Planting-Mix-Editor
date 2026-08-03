@@ -4,8 +4,8 @@
         Title="Mix Schedules"
         WindowStartupLocation="CenterScreen"
         SizeToContent="WidthAndHeight"
-        MinWidth="600"
-        Width="600"
+        MinWidth="760"
+        Width="760"
         MaxHeight="800"
         Background="#FFF9F9F9"
         ResizeMode="CanResizeWithGrip">
@@ -53,6 +53,11 @@
             <StackPanel DockPanel.Dock="Right"
                         Orientation="Horizontal"
                         HorizontalAlignment="Right">
+                <Button x:Name="ApproxNumbersToggle"
+                        Content="Approximate Numbers"
+                        MinWidth="135"
+                        Margin="4,0,8,0"
+                        Padding="10,4"/>
                 <Button x:Name="ApplyButton"
                         Content="Apply"
                         Width="80"
