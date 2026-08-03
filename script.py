@@ -25,6 +25,11 @@ import tempfile
 import datetime
 import clr
 
+from mix_library_helpers import (
+    apply_library_payload_to_row,
+    invoke_plant_library,
+)
+
 from pyrevit import revit, DB, script, forms
 
 from Autodesk.Revit.DB import *
@@ -3903,25 +3908,18 @@ class MixWindowController(object):
             .format(mix.mix_name, len(mix.rows), slots_left, percent_remaining)
         )
 
+        library_context = {
+            'max_slots': slots_left,
+            'percent_remaining': percent_remaining,
+            'current_total_percent': current_total_percent,
+            'most_common_grade': most_common_grade,
+            'mix_context': mix_context,
+        }
         try:
-            selected = plant_library.open_plant_library_dialog_for_mix(
-                max_slots=slots_left,
-                percent_remaining=percent_remaining,
-                current_total_percent=current_total_percent,
-                most_common_grade=most_common_grade,
-                mix_context=mix_context
+            selected = invoke_plant_library(
+                plant_library.open_plant_library_dialog_for_mix,
+                library_context
             )
-        except TypeError:
-            try:
-                selected = plant_library.open_plant_library_dialog_for_mix(
-                    max_slots=slots_left,
-                    percent_remaining=percent_remaining,
-                    current_total_percent=current_total_percent,
-                    most_common_grade=most_common_grade
-                )
-            except TypeError:
-                # Fallback if the other script still has the old signature
-                selected = plant_library.open_plant_library_dialog_for_mix()
         except Exception as ex:
             forms.alert(
                 u"Error while running plant library dialog:\n{0}".format(ex),
@@ -3942,6 +3940,8 @@ class MixWindowController(object):
         # ------------------------------------------------------------
         # 3. For each returned plant, add and populate a SpeciesRow
         # ------------------------------------------------------------
+        skipped_rows = 0
+        added_rows = 0
         for row_data in selected:
             if len(mix.rows) >= MAX_SPECIES:
                 forms.alert(
@@ -3950,64 +3950,57 @@ class MixWindowController(object):
                 )
                 break
 
-            mix.add_row()
-            row = mix.rows[-1]
+            candidate = SpeciesRow(
+                len(mix.rows) + 1, u'', u'', u'', u'', u'', u'', True
+            )
+            try:
+                valid, reason = apply_library_payload_to_row(
+                    candidate,
+                    row_data,
+                    lambda value: pct_raw_to_display(
+                        value, assume_internal_decimal=False
+                    ),
+                    space_raw_to_display,
+                )
+            except Exception as ex:
+                valid, reason = False, _to_unicode(ex)
+            if not valid:
+                skipped_rows += 1
+                LOGGER.warning(
+                    'MIX LIBRARY: skipped returned plant: {0}'.format(reason)
+                )
+                continue
 
-            code      = _to_unicode(row_data.get('Code', u''))
-            spread_mm = row_data.get('SpreadMM', None)
-            botanical = _to_unicode(row_data.get('Botanical', u''))
-            common    = _to_unicode(row_data.get('Common', u''))
-            percent   = row_data.get('Percent', None)
-            spacing   = row_data.get('Spacing', None)
-            grade     = row_data.get('Grade', None)
-            is_groundcover = row_data.get('IsGroundcover', None)
-            is_tree = row_data.get('IsTree', None)
+            mix.rows.append(candidate)
+            mix.num_species = len(mix.rows)
+            mix.dirty = True
+            added_rows += 1
+            classification = (
+                u'Groundcover' if candidate.is_groundcover else u'Tree'
+            )
+            value_source = _to_unicode(row_data.get('ValueSource', u'')).strip()
+            retained = _to_unicode(row_data.get('RetainedFields', u'')).strip()
+            updated = _to_unicode(row_data.get('UpdatedFields', u'')).strip()
+            LOGGER.info(
+                'MIX LIBRARY: added botanical="{0}"; code="{1}"; '
+                'spacing="{2}"; grade="{3}"; class={4}; source="{5}"; '
+                'retained="{6}"; updated="{7}"'
+                .format(candidate.bot, candidate.code, candidate.spacing,
+                        candidate.grade, classification, value_source,
+                        retained, updated)
+            )
 
-            row.code = code
-            row.bot  = botanical
-            row.com  = common
+        if skipped_rows:
+            forms.alert(
+                u'Skipped {0} malformed plant selection{1}; valid selections '
+                u'were still added.'.format(
+                    skipped_rows, u'' if skipped_rows == 1 else u's'
+                ),
+                title='Add Plant (library)'
+            )
 
-            if is_groundcover not in (None, u'', ''):
-                row.is_groundcover = _coerce_yes_no_to_bool(is_groundcover, default=True)
-            elif is_tree not in (None, u'', ''):
-                row.is_groundcover = not _coerce_yes_no_to_bool(is_tree, default=False)
-            else:
-                row.is_groundcover = True
-
-            # Project mix palette values win over library spread-derived defaults.
-            if spacing not in (None, u'', ''):
-                spacing_text = _to_unicode(spacing).strip()
-                try:
-                    if u'm' in spacing_text.lower():
-                        row.spacing = space_raw_to_display(space_display_to_raw(spacing_text))
-                    else:
-                        row.spacing = space_raw_to_display(spacing_text)
-                except Exception:
-                    row.spacing = spacing_text
-            elif spread_mm not in (None, u'', ''):
-                try:
-                    raw_mm_str = _to_unicode(spread_mm)
-                    row.spacing = space_raw_to_display(raw_mm_str)
-                except Exception:
-                    row.spacing = u''
-            else:
-                row.spacing = u''
-
-            # Percent – previous project mix palette values are retained exactly;
-            # otherwise use the standard new-plant default of 10%.
-            if percent not in (None, u'', ''):
-                try:
-                    row.pct = pct_raw_to_display(percent, assume_internal_decimal=False)
-                except Exception:
-                    row.pct = _to_unicode(percent)
-            else:
-                row.pct = u'10%'
-
-            # Grade – already a display string
-            if grade not in (None, u''):
-                row.grade = _to_unicode(grade)
-            else:
-                row.grade = u''
+        if not added_rows:
+            return
 
         # 4. Sort, rebuild the UI and refresh the header percent summary
         _sort_mix_rows_alphabetically(mix)
