@@ -41,7 +41,7 @@ TREE_KEYWORD = "tree"                # Look for this in name/family/header
 TRUNK_PARAM_NAME = "Trunk Diameter"  # Tree type param for trunk diameter (ft)
 
 SEARCH_MARGIN_M = 1.5                # Search a bit outside the floor boundary
-PLANT_OFFSET_M = 0.20                # Extra outward offset on plant radius
+PLANT_OFFSET_M = 0.05                # Extra outward offset on plant radius
 FLOOR_OFFSET_MM = 5.0                # Floor boundary offset inward (mm) when no plants
 
 TREE_EXTRA_DIAM_MM = 100.0           # Extra diameter added to Trunk Diameter circle
@@ -61,6 +61,19 @@ def get_any_3d_view(doc):
         if not v.IsTemplate:
             return v
     return None
+
+
+def get_element_id_value(element_id):
+    """Return integer value for an ElementId across Revit versions."""
+    try:
+        return element_id.IntegerValue
+    except Exception:
+        pass
+    try:
+        return element_id.Value
+    except Exception:
+        pass
+    return int(element_id)
 
 
 def get_floor_below_point(doc, pickpoint):
@@ -267,7 +280,7 @@ def delete_existing_boundaries_in_region(doc, view, minx, maxx, miny, maxy, boun
         cat = ce.Category
         if not cat:
             continue
-        cid = cat.Id.IntegerValue
+        cid = get_element_id_value(cat.Id)
         if cid != bic_scheme and (bic_boundary is None or cid != bic_boundary):
             continue
 
