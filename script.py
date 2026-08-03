@@ -18,6 +18,8 @@ import sys
 import imp
 import clr
 
+from library_integration import invoke_plant_library, species_update_from_payload
+
 from pyrevit import revit, DB, script, forms
 
 from Autodesk.Revit.DB import *
@@ -987,6 +989,9 @@ class SpeciesRow(object):
         self.bot = bot or u''
         self.com = com or u''
         self.grade = grade or u''
+        # Newer schedule families persist this field; retaining it here also
+        # lets a resolved Plant Library payload preserve its classification.
+        self.is_groundcover = True
 
 
 class MixModel(object):
@@ -2610,16 +2615,18 @@ class MixWindowController(object):
         # ------------------------------------------------------------
         # 2. Call the plant picker in 'mix mode', passing context
         # ------------------------------------------------------------
+        library_context = {
+            'max_slots': slots_left,
+            'percent_remaining': percent_remaining,
+            'current_total_percent': current_total_percent,
+            'most_common_grade': most_common_grade,
+            'mix_context': getattr(mix, 'mix_context', None),
+        }
         try:
-            selected = plant_library.open_plant_library_dialog_for_mix(
-                max_slots=slots_left,
-                percent_remaining=percent_remaining,
-                current_total_percent=current_total_percent,
-                most_common_grade=most_common_grade
+            selected = invoke_plant_library(
+                plant_library.open_plant_library_dialog_for_mix,
+                library_context
             )
-        except TypeError:
-            # Fallback if the other script still has the old signature
-            selected = plant_library.open_plant_library_dialog_for_mix()
         except Exception as ex:
             forms.alert(
                 u"Error while running plant library dialog:\n{0}".format(ex),
@@ -2634,6 +2641,8 @@ class MixWindowController(object):
         # ------------------------------------------------------------
         # 3. For each returned plant, add and populate a SpeciesRow
         # ------------------------------------------------------------
+        added_count = 0
+        skipped_count = 0
         for row_data in selected:
             if len(mix.rows) >= MAX_SPECIES:
                 forms.alert(
@@ -2642,48 +2651,57 @@ class MixWindowController(object):
                 )
                 break
 
+            try:
+                update = species_update_from_payload(
+                    row_data, pct_raw_to_display, space_raw_to_display, True
+                )
+            except Exception as ex:
+                skipped_count += 1
+                LOGGER.warning(u"Skipped malformed Plant Library row: {0}".format(ex))
+                continue
+
+            # Add only after validation, so malformed results never create blanks.
             mix.add_row()
             row = mix.rows[-1]
+            row.code = update['code']
+            row.bot = update['bot']
+            row.com = update['com']
+            row.grade = update['grade']
+            row.pct = update['pct']
+            row.spacing = update['spacing']
+            row.is_groundcover = update['is_groundcover']
+            added_count += 1
 
-            code      = _to_unicode(row_data.get('Code', u''))
-            spread_mm = row_data.get('SpreadMM', None)
-            botanical = _to_unicode(row_data.get('Botanical', u''))
-            common    = _to_unicode(row_data.get('Common', u''))
-            percent   = row_data.get('Percent', None)
-            grade     = row_data.get('Grade', None)
+            value_source = row_data.get('ValueSource', u'')
+            retained = row_data.get('RetainedFields', u'')
+            updated = row_data.get('UpdatedFields', u'')
+            LOGGER.info(
+                u"Plant Library add: botanical='{0}', code='{1}', spacing='{2}', "
+                u"grade='{3}', class={4}, source='{5}', retained='{6}', updated='{7}'"
+                .format(row.bot, row.code, row.spacing, row.grade,
+                        u'Groundcover' if row.is_groundcover else u'Tree',
+                        _to_unicode(value_source), _to_unicode(retained),
+                        _to_unicode(updated))
+            )
 
-            row.code = code
-            row.bot  = botanical
-            row.com  = common
+        if skipped_count:
+            forms.alert(
+                u"Skipped {0} malformed Plant Library {1}.".format(
+                    skipped_count, u'row' if skipped_count == 1 else u'rows'),
+                title="Add Plant (library)"
+            )
 
-            # Spacing from SpreadMM (mm) -> display string (e.g. '3m')
-            if spread_mm not in (None, u''):
-                try:
-                    raw_mm_str = _to_unicode(spread_mm)
-                    row.spacing = space_raw_to_display(raw_mm_str)
-                except Exception:
-                    row.spacing = u''
-            else:
-                row.spacing = u''
-
-            # Percent – convert whatever we get ('50', 50, 0.5, '50%')
-            if percent not in (None, u''):
-                try:
-                    row.pct = pct_raw_to_display(percent)
-                except Exception:
-                    row.pct = u''
-            else:
-                row.pct = u''
-
-            # Grade – already a display string
-            if grade not in (None, u''):
-                row.grade = _to_unicode(grade)
-            else:
-                row.grade = u''
-
-        # 4. Rebuild the UI and refresh the header percent summary
-        self._render_mix_body(mix)
-        self._update_mix_percent_summary(mix)
+        if added_count:
+            mix.rows.sort(key=lambda item: (item.bot or u'').lower())
+            for index, row in enumerate(mix.rows):
+                row.index = index + 1
+            mix.num_species = len(mix.rows)
+            mix.dirty = True
+            self._render_mix_body(mix)
+            self._update_mix_percent_summary(mix)
+            approximate_refresh = getattr(self, '_update_mix_approximate_numbers', None)
+            if approximate_refresh:
+                approximate_refresh(mix)
 
 
     def on_create_new_mix(self, sender, args):
